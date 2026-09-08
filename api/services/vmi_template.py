@@ -112,7 +112,19 @@ def role_of(*texts: Any, gl_number: str = "") -> str:
     role = _ROLE_BY_ACCOUNT.get(str(gl_number or "").strip().upper())
     if role:
         return role
+    # An account the map does not know gets a role from its name only as a last
+    # resort. Names are shared across accounts that do different jobs: "FLOOR
+    # PLAN ASST." is an allowance, not the floor plan itself, and matching it
+    # to the floor-plan role posted the price of the car twice.
+    if gl_number and str(gl_number).strip():
+        return _role_from_names(*texts)
 
+    return _role_from_names(*texts)
+
+
+def _role_from_names(*texts: Any) -> str:
+    """A role guessed from an account name. Weaker than the number, and known
+    to be fallible -- see the caller."""
     for text in texts:
         flat = _normalise(text)
         if not flat:
@@ -261,6 +273,13 @@ def fill(
             source = f"annotated {gl}"
             used.add(gl)
             annotated_index.add(index)
+            # An annotated line still CONSUMES its role. Without this, 3300
+            # taking the floor plan from the handwriting left the floor-plan
+            # role unclaimed, and Oakbrook Toyota's "8041 FLOOR PLAN ASST." --
+            # an allowance account, not the note payable -- matched it by name
+            # and credited the entire invoice a second time.
+            if role:
+                roles_filled.add(role)
 
         # 2. A role the template describes, computed from the invoice. Ahead of
         # the mirror rule because an inventory line that happens to sit under an
