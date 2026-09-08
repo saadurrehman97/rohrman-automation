@@ -118,9 +118,15 @@ TEMPLATE_PREFERENCE: dict[str, str] = {}
 # Confirmed for 1710 only. A store that is not listed simply gets no DOC fee
 # lines, which is the right default: inventing one would post money nobody
 # asked for.
-STORE_DOC_FEE: dict[str, float] = {
-    "1710": 380.00,  # Bob Rohrman Schaumburg Kia
-}
+# Every store charges it; only some keep it in their template. Ford has it
+# preset at 380.00 and uses that; Kia and Oakbrook Toyota leave the line at zero
+# and take this figure instead. It was per-store, which meant a store nobody had
+# listed silently produced no DOC fee lines at all -- which is what happened to
+# Oakbrook Toyota.
+DEFAULT_DOC_FEE = 380.00
+
+# Only for a store that genuinely differs from the default.
+STORE_DOC_FEE: dict[str, float] = {}
 
 _REF_TEXT_MAX = 50
 
@@ -188,6 +194,9 @@ class VehicleInvoiceFacts:
     # detail: an account a person wrote and the system dropped means the entry
     # is short a line, and posting the rest is worse than posting nothing.
     unpriced_gl_accounts: list[str] = field(default_factory=list)
+    # What OCR says each amount was read from ("PPO RESERVE"). Used to check
+    # the pairing against the account's own name -- see repair_by_label.
+    gl_annotation_labels: dict[str, str] = field(default_factory=dict)
 
     def amount(self, key: str) -> float | None:
         value = self.annotated_amounts.get(key)
@@ -758,12 +767,27 @@ def create_vehicle_journal_entry(
         )
 
     chart = service.chart_by_account_id()
+
+    # OCR pairs an account with a figure by following an arrow, and two arrows
+    # over one sentence can cross. The labels it reports say what each amount
+    # actually was, so a crossed pair is caught and put back.
+    annotations, repairs = vmi_template.repair_by_label(
+        facts.gl_annotations,
+        facts.gl_annotation_labels,
+        chart,
+        tekion_template.get("postings") or [],
+    )
+    for note in repairs:
+        print(f"[VMI] corrected: {note}")
+    facts.gl_annotations = annotations
+    result.gl_annotations = dict(annotations)
+
     filled = vmi_template.fill(
         tekion_template,
         facts.gl_annotations,
         facts.dealer_cost_total,
         chart,
-        doc_fee=STORE_DOC_FEE.get(dealer_id),
+        doc_fee=STORE_DOC_FEE.get(dealer_id, DEFAULT_DOC_FEE),
     )
 
     # An annotation with nowhere to go is the clearest possible signal that this

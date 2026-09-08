@@ -282,6 +282,26 @@ def get_gl_annotations(ocr: dict[str, Any]) -> dict[str, float]:
     return found
 
 
+def get_gl_annotation_labels(ocr: dict[str, Any]) -> dict[str, str]:
+    """{GL account -> the label OCR says that amount came from}.
+
+    OCR reports its own reasoning in `mapped_description`: "PPO RESERVE",
+    "WHOLESALE FINANCE RESERVE". That is the only evidence available for
+    checking whether an account was tied to the right figure, and on the
+    Oakbrook Toyota invoice it is what shows the two were swapped -- 2250's
+    Tekion name ends in WFR, and the WFR figure had been given to 2245.
+    """
+    labels: dict[str, str] = {}
+    for entry in list(ocr.get("gl_mappings") or []) + list(ocr.get("gl_annotations") or []):
+        if not isinstance(entry, dict):
+            continue
+        account = re.sub(r"[^0-9A-Za-z]", "", str(entry.get("gl_account") or ""))
+        label = str(entry.get("mapped_description") or entry.get("source") or "").strip()
+        if account and label:
+            labels[account] = label
+    return labels
+
+
 def get_annotated_gl_accounts(ocr: dict[str, Any]) -> list[str]:
     """GL account numbers written on the invoice, in reading order.
 
@@ -329,6 +349,7 @@ def build_facts(ocr: dict[str, Any], dealership_name: str = "") -> VehicleInvoic
         annotated_gl_accounts=get_annotated_gl_accounts(ocr),
         gl_annotations=annotations,
         unpriced_gl_accounts=get_unpriced_gl_accounts(ocr, annotations),
+        gl_annotation_labels=get_gl_annotation_labels(ocr),
     )
 
 
