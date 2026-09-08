@@ -768,19 +768,11 @@ def create_vehicle_journal_entry(
 
     chart = service.chart_by_account_id()
 
-    # OCR pairs an account with a figure by following an arrow, and two arrows
-    # over one sentence can cross. The labels it reports say what each amount
-    # actually was, so a crossed pair is caught and put back.
-    annotations, repairs = vmi_template.repair_by_label(
-        facts.gl_annotations,
-        facts.gl_annotation_labels,
-        chart,
-        tekion_template.get("postings") or [],
-    )
-    for note in repairs:
-        print(f"[VMI] corrected: {note}")
-    facts.gl_annotations = annotations
-    result.gl_annotations = dict(annotations)
+    # The account written on the invoice goes to the template line with that
+    # account number, for the amount OCR read. Nothing is inferred, reassigned
+    # or second-guessed here: if an amount is wrong it is wrong in the reading,
+    # and correcting it downstream only hides where the fault is.
+    annotations = facts.gl_annotations
 
     filled = vmi_template.fill(
         tekion_template,

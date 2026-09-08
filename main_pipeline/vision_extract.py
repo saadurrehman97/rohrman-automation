@@ -107,13 +107,22 @@ GL ACCOUNTS & SPATIAL BINDING:
      description, or amount, bind the GL code to that target item regardless of where it appears.
      THE TARGET MAY BE INSIDE A SENTENCE, not only in a table. Vehicle invoices state figures in
      prose -- "DEALER RECEIVES A RESERVE OF $1,129.00, WHICH INCLUDES A PPO RESERVE OF $392.00,
-     AND WHOLESALE FINANCE RESERVE OF $368.00" -- and an arrow drawn above that line is pointing
-     at the figure it lands on, not at the nearest total elsewhere on the page. Read the amount
-     the arrow actually touches. Two arrows over the same sentence point at two different figures
-     in it.
-  2b. NEVER invent the pairing. If a GL code is written but you cannot determine which figure it
-     points to, still report the code in `gl_mappings[]` with `"amount": null` and say in
-     `mapped_description` what was unclear. A wrong amount is far worse than a missing one: it
+     AND WHOLESALE FINANCE RESERVE OF $368.00".
+
+     FOLLOW THE ARROW BY POSITION. An arrow drawn above a line of text points at whatever is
+     DIRECTLY BELOW ITS TIP -- compare horizontal positions and take the figure the tip lands on
+     or nearest to it. Do not pick a figure because its wording sounds related to the account, and
+     do not pick the first or last figure in the sentence by default. Where two arrows sit above
+     the same sentence they land at different horizontal positions and therefore on different
+     figures; the LEFTMOST arrow takes the leftmost figure it reaches, the next arrow the next.
+
+     On the invoice above, an arrow whose tip sits over "$1,129.00" means $1,129.00 -- not the
+     $392.00 or $368.00 later in the same sentence.
+  2b. NEVER invent the pairing. If a GL code is written but you cannot determine which figure its
+     arrow lands on, report the code in `gl_mappings[]` with `"amount": null` and say in
+     `mapped_description` what was unclear. Guessing from wording is what produces a confident
+     wrong answer: an account named for one thing is routinely pointed at a figure described as
+     another, and only the arrow says which. A wrong amount is far worse than a missing one: it
      posts real money to a real account and balances, so nothing downstream can detect it.
   3. Enclosure & Contour Grouping: If a dollar amount, line item, fee, discount, or tax line is
      circled, boxed, or underlined, and a GL code is written inside or adjacent to that boundary,
