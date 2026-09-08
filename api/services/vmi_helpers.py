@@ -152,6 +152,18 @@ _NOT_A_FINAL_COST = ("sub", "base", "unit", "option", "freight", "handling")
 # inferred from magnitudes.
 _FINAL_TOTAL_LABELS = ("totalinvoice", "invoicetotal", "totaldue", "grandtotal")
 
+# These invoices print two money columns, and OCR may report them either as one
+# row with two keys or as two rows whose labels name the column:
+#
+#     TOTAL INVOICE (MSRP)            40712.00
+#     TOTAL INVOICE (DEALER INVOICE)  38189.40
+#
+# Both match "total invoice", so taking the first found read the MSRP -- the
+# customer price -- as what the dealership owes. The column has to be chosen
+# explicitly, not by whichever arrived first.
+_MSRP_COLUMN = ("msrp", "retail", "suggested")
+_DEALER_COLUMN = ("dealer", "cost", "invoiceprice")
+
 
 def get_dealer_cost_total(ocr: dict[str, Any]) -> float:
     """The FINAL dealer cost -- what the dealership owes for the car.
@@ -166,11 +178,26 @@ def get_dealer_cost_total(ocr: dict[str, Any]) -> float:
     #    so it is tried first. Toyota prints four dealer figures down the page
     #    -- TOTAL F.I.E., TOTAL MODEL AND F.I.E., SUB TOTAL, TOTAL INVOICE --
     #    and only the last is what the dealership owes.
+    fallback_total: float | None = None
     for row in _rows(ocr):
         label = _normalise(
             row.get("label") or row.get("description") or row.get("name") or ""
         )
         if not any(hint in label for hint in _FINAL_TOTAL_LABELS):
+            continue
+
+        # Never the MSRP column, whatever order it arrives in.
+        if any(hint in label for hint in _MSRP_COLUMN):
+            continue
+
+        # A label that names the dealer column is the answer outright. One that
+        # names no column is kept aside: it is right on an invoice with a single
+        # money column, and wrong to prefer over an explicit dealer row.
+        names_dealer = any(hint in label for hint in _DEALER_COLUMN)
+        if not names_dealer:
+            amount = _amount(row.get("value") if "value" in row else row.get("amount"))
+            if amount and fallback_total is None:
+                fallback_total = abs(amount)
             continue
         # A dealer-specific column if the row has one (Toyota prints MSRP and
         # DEALER INVOICE side by side)...
@@ -186,6 +213,9 @@ def get_dealer_cost_total(ocr: dict[str, Any]) -> float:
         amount = _amount(row.get("value") if "value" in row else row.get("amount"))
         if amount:
             return abs(amount)
+
+    if fallback_total is not None:
+        return fallback_total
 
     # 2. Otherwise collect every dealer-column figure and take the largest.
     #    A total always exceeds its own subtotals, and taking the first match
