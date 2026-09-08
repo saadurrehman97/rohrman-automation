@@ -118,6 +118,20 @@ GL ACCOUNTS & SPATIAL BINDING:
 
      On the invoice above, an arrow whose tip sits over "$1,129.00" means $1,129.00 -- not the
      $392.00 or $368.00 later in the same sentence.
+  2a. TRANSCRIBE BEFORE YOU DECIDE. For every handwritten GL code with an arrow, first read out
+     the text the arrow TIP physically touches -- roughly 40 characters of the line directly
+     beneath it, copied verbatim -- and put that in `mapped_description`. Then take `amount` from
+     the money figure inside THAT span, and nowhere else.
+
+     This is a transcription task, not a judgement: copy what is under the tip and read its
+     number. Do not summarise the clause, do not name the kind of figure it is, and do not choose
+     between figures elsewhere in the sentence because their wording suits the account.
+
+     A sentence may hold several figures -- "A RESERVE OF $1,129.00, WHICH INCLUDES A PPO RESERVE
+     OF $392.00, AND WHOLESALE FINANCE RESERVE OF $368.00" holds three. Two handwritten codes do
+     NOT mean the last two figures, or the first two. Each code takes the figure its own arrow
+     lands on, and two codes may well land on figures that are not adjacent.
+
   2b. NEVER invent the pairing. If a GL code is written but you cannot determine which figure its
      arrow lands on, report the code in `gl_mappings[]` with `"amount": null` and say in
      `mapped_description` what was unclear. Guessing from wording is what produces a confident
