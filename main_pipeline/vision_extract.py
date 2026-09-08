@@ -105,6 +105,16 @@ GL ACCOUNTS & SPATIAL BINDING:
      row its own `gl_account`.
   2. Vector / Arrow Anchoring: If a line or arrow points from a GL code to a specific cell, part
      description, or amount, bind the GL code to that target item regardless of where it appears.
+     THE TARGET MAY BE INSIDE A SENTENCE, not only in a table. Vehicle invoices state figures in
+     prose -- "DEALER RECEIVES A RESERVE OF $1,129.00, WHICH INCLUDES A PPO RESERVE OF $392.00,
+     AND WHOLESALE FINANCE RESERVE OF $368.00" -- and an arrow drawn above that line is pointing
+     at the figure it lands on, not at the nearest total elsewhere on the page. Read the amount
+     the arrow actually touches. Two arrows over the same sentence point at two different figures
+     in it.
+  2b. NEVER invent the pairing. If a GL code is written but you cannot determine which figure it
+     points to, still report the code in `gl_mappings[]` with `"amount": null` and say in
+     `mapped_description` what was unclear. A wrong amount is far worse than a missing one: it
+     posts real money to a real account and balances, so nothing downstream can detect it.
   3. Enclosure & Contour Grouping: If a dollar amount, line item, fee, discount, or tax line is
      circled, boxed, or underlined, and a GL code is written inside or adjacent to that boundary,
      bind the GL code exclusively to that enclosed item and amount.

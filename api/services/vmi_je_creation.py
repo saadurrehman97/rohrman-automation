@@ -184,6 +184,10 @@ class VehicleInvoiceFacts:
     # The real input: {GL account -> the amount the clerk pointed it at}.
     # "2245" against KAC0780KAC means 780.00 belongs in holdback receivable.
     gl_annotations: dict[str, float] = field(default_factory=dict)
+    # Accounts written on the invoice that OCR could not tie to a figure. Not a
+    # detail: an account a person wrote and the system dropped means the entry
+    # is short a line, and posting the rest is worse than posting nothing.
+    unpriced_gl_accounts: list[str] = field(default_factory=list)
 
     def amount(self, key: str) -> float | None:
         value = self.annotated_amounts.get(key)
@@ -682,6 +686,16 @@ def create_vehicle_journal_entry(
         result.refusal = "no stock number on the invoice (write it on before uploading)"
         result.needs = ["stock_number"]
         return result
+    if facts.unpriced_gl_accounts:
+        accounts = ", ".join(facts.unpriced_gl_accounts)
+        result.refusal = (
+            f"account {accounts} is written on the invoice but no amount could be "
+            "read for it. Posting the other lines would leave the entry short, so "
+            "supply the amount and run it again"
+        )
+        result.needs = ["gl_annotations"]
+        return result
+
     if not facts.gl_annotations:
         result.refusal = (
             "no GL accounts were read off the invoice. The clerk writes an account "

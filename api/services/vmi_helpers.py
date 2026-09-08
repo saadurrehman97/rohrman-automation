@@ -314,6 +314,7 @@ def build_facts(ocr: dict[str, Any], dealership_name: str = "") -> VehicleInvoic
     # document row identifiable and keeps the duplicate check meaningful --
     # one VIN is one car is one invoice.
     invoice_number = ocr_helpers.get_invoice_number(ocr) or ocr_helpers.get_vin(ocr)
+    annotations = get_gl_annotations(ocr)
 
     return VehicleInvoiceFacts(
         invoice_number=invoice_number,
@@ -326,7 +327,8 @@ def build_facts(ocr: dict[str, Any], dealership_name: str = "") -> VehicleInvoic
         msrp_total=get_msrp_total(ocr),
         annotated_amounts=get_annotated_amounts(ocr),
         annotated_gl_accounts=get_annotated_gl_accounts(ocr),
-        gl_annotations=get_gl_annotations(ocr),
+        gl_annotations=annotations,
+        unpriced_gl_accounts=get_unpriced_gl_accounts(ocr, annotations),
     )
 
 
@@ -407,3 +409,31 @@ def apply_overrides(facts: VehicleInvoiceFacts, overrides: dict[str, Any]) -> li
     if changed:
         print(f"[VMI] manual overrides applied: {', '.join(changed)}")
     return changed
+
+
+def get_unpriced_gl_accounts(ocr: dict[str, Any], priced: dict[str, float]) -> list[str]:
+    """Accounts written on the invoice that came back WITHOUT an amount.
+
+    OCR reports the handwriting it can see in `handwritten_notes` and the pairs
+    it managed to bind in `gl_mappings`. When an account appears in the first
+    and not the second, it was read off the page and then lost -- the arrow was
+    not followed to a figure.
+
+    That is not a harmless gap. On the Oakbrook Toyota invoice both 2245 and
+    2250 were written; only 2245 was bound, so the entry posted three lines
+    instead of seven and nobody was told. An account a person wrote and the
+    system silently dropped is exactly the kind of omission that has to stop the
+    document rather than shrink it.
+    """
+    missing: list[str] = []
+    for note in ocr.get("handwritten_notes") or []:
+        for match in re.finditer(r"\b(\d{4,5}[A-Za-z]?)\b", str(note or "")):
+            account = match.group(1)
+            # A stock number is digits too, so only count something that looks
+            # like an account and is not already accounted for.
+            if account in priced or account in missing:
+                continue
+            if _stock_from(note) and account in _stock_from(note):
+                continue
+            missing.append(account)
+    return missing
