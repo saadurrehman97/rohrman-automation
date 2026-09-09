@@ -292,6 +292,14 @@ def get_annotated_amounts(ocr: dict[str, Any]) -> dict[str, float]:
 _ACCOUNT_IN_TEXT = re.compile(r"\b(\d{4,5}[A-Za-z]?)\b")
 
 
+# An account the writer labelled as one: "GL 2245", "GL# 2250", "ACCT 7193".
+# The label is what separates the account from the amount beside it.
+_MARKED_ACCOUNT = re.compile(
+    r"(?:GL|G/L|ACCT|ACCOUNT|A/C)\s*#?\s*(\d{4,5}[A-Za-z]?)\b",
+    re.IGNORECASE,
+)
+
+
 def _account_number(text: Any) -> str:
     match = _ACCOUNT_IN_TEXT.search(str(text or ""))
     return match.group(1).upper() if match else ""
@@ -522,14 +530,34 @@ def get_unpriced_gl_accounts(ocr: dict[str, Any], priced: dict[str, float]) -> l
     document rather than shrink it.
     """
     missing: list[str] = []
-    for note in ocr.get("handwritten_notes") or []:
-        for match in re.finditer(r"\b(\d{4,5}[A-Za-z]?)\b", str(note or "")):
-            account = match.group(1)
-            # A stock number is digits too, so only count something that looks
-            # like an account and is not already accounted for.
+    for raw in ocr.get("handwritten_notes") or []:
+        note = str(raw or "")
+
+        # A note that reads "GL 2245 1129$" contains TWO four-digit numbers, and
+        # only the first is an account -- the second is the amount. Reading both
+        # as accounts reported 1129 as written-but-unpriced and refused an
+        # invoice OCR had got completely right.
+        #
+        # So where a note names its account explicitly, take that and nothing
+        # else from the note. Only a note with no such marker falls back to
+        # scanning it for bare numbers, which is the older style where an
+        # account is written on its own.
+        marked = _MARKED_ACCOUNT.search(note)
+        candidates = (
+            [marked.group(1)]
+            if marked
+            else [m.group(1) for m in _ACCOUNT_IN_TEXT.finditer(note)]
+        )
+
+        for account in candidates:
+            account = account.upper()
             if account in priced or account in missing:
                 continue
-            if _stock_from(note) and account in _stock_from(note):
+            # A stock number is digits too -- but only worth guarding against
+            # when the note did NOT label the number as an account. "GL 8041"
+            # also parses as the stock pattern (letters then digits), and
+            # applying the guard there discarded a genuinely missing account.
+            if not marked and _stock_from(note) and account in _stock_from(note):
                 continue
             missing.append(account)
     return missing
