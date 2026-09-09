@@ -698,17 +698,6 @@ def create_vehicle_journal_entry(
         result.refusal = "no stock number on the invoice (write it on before uploading)"
         result.needs = ["stock_number"]
         return result
-    if facts.prose_sourced_accounts:
-        accounts = ", ".join(facts.prose_sourced_accounts)
-        result.refusal = (
-            f"the amounts for {accounts} were read out of a sentence on the invoice, "
-            "and that reading has been wrong every time -- it lands a line below "
-            "where the arrow points. Enter the amounts here, or write them beside "
-            "the accounts on the invoice as \"GL 2245 1129.00\""
-        )
-        result.needs = ["gl_annotations"]
-        return result
-
     if facts.unpriced_gl_accounts:
         accounts = ", ".join(facts.unpriced_gl_accounts)
         result.refusal = (
