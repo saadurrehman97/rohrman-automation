@@ -61,6 +61,7 @@ SIGNS
 """
 from __future__ import annotations
 
+import difflib
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -454,22 +455,30 @@ def _assign(
     # Pass 1: account AND label. The template's description is the store's own
     # word for the line -- "HTB", "FLOORASST" -- and the clerk writes that same
     # word on the page, which is the only thing that tells three 2248s apart.
-    unlabelled: list[GlAnnotation] = []
-    for annotation in annotations:
-        hit = next(
-            (
-                i
-                for i, p in enumerate(postings)
-                if i not in assigned
-                and numbers[i] == annotation.account
-                and _label_matches(annotation.label, p.get("description"))
-            ),
-            None,
-        )
-        if hit is None:
-            unlabelled.append(annotation)
-        else:
-            assigned[hit] = annotation
+    #
+    # Every pair is SCORED and the strongest match is taken first, rather than
+    # walking the annotations in order and giving each the first line it likes.
+    # Order-of-appearance is not evidence: two annotations on one account can
+    # both half-match the same line, and whichever came first won.
+    scored: list[tuple[float, int, int]] = []
+    for a_index, annotation in enumerate(annotations):
+        for line_index, p in enumerate(postings):
+            if numbers[line_index] != annotation.account:
+                continue
+            score = _label_score(annotation.label, p.get("description"))
+            if score >= _LABEL_THRESHOLD:
+                scored.append((score, a_index, line_index))
+
+    # Best score first; ties fall back to reading order so this stays stable.
+    scored.sort(key=lambda t: (-t[0], t[1], t[2]))
+    matched: set[int] = set()
+    for _score, a_index, line_index in scored:
+        if a_index in matched or line_index in assigned:
+            continue
+        assigned[line_index] = annotations[a_index]
+        matched.add(a_index)
+
+    unlabelled = [a for i, a in enumerate(annotations) if i not in matched]
 
     # Pass 2: account number alone, which is how every store that annotates
     # without labels has always worked.
@@ -510,36 +519,77 @@ def _pick(
         if preset and round(abs(float(preset)), 2) == round(abs(annotation.amount), 2):
             return i
 
-    # Otherwise leave the computed lines alone: holdback, floor plan and
-    # invoice price are derived from the invoice total, and an annotation that
-    # did not name one of them should not land on one.
-    for i in candidates:
-        number = gl_number_of(postings[i].get("glAccountId"), chart)
-        if not role_of(
-            postings[i].get("description"),
-            _account_name(postings[i].get("glAccountId"), chart),
-            gl_number=number,
-        ):
-            return i
+    def plays_a_role(i: int) -> bool:
+        # Holdback, floor plan and invoice price are computed from the invoice
+        # total. An annotation that did not name one of them should not land on
+        # one.
+        return bool(
+            role_of(
+                postings[i].get("description"),
+                _account_name(postings[i].get("glAccountId"), chart),
+                gl_number=gl_number_of(postings[i].get("glAccountId"), chart),
+            )
+        )
+
+    def disagrees_with_its_preset(i: int) -> bool:
+        # A store that typed 150.00 into a line stated what that line holds.
+        # An annotation of 428.00 is evidence about some OTHER line, and putting
+        # it here would overwrite a decision with a guess. This is the second
+        # guard on Honda's DMA line, which is preset to 150.00 and sits above
+        # two 2248 lines left at zero.
+        preset = postings[i].get("amount")
+        return bool(preset) and round(abs(float(preset)), 2) != round(
+            abs(annotation.amount), 2
+        )
+
+    for test in (
+        lambda i: not plays_a_role(i) and not disagrees_with_its_preset(i),
+        lambda i: not plays_a_role(i),
+        lambda i: not disagrees_with_its_preset(i),
+    ):
+        for i in candidates:
+            if test(i):
+                return i
 
     return candidates[0]
 
 
-def _label_matches(annotation_label: Any, line_description: Any) -> bool:
-    """Whether the word beside the account is this template line's own word.
+# How close a reading of a handwritten label has to be to count as that label.
+#
+# 0.75 is chosen so a three-letter label is still effectively exact -- "HTB"
+# against "HUB" scores 0.67 and does not match -- while a longer one tolerates
+# the character or two that handwriting costs. "FLOORASUT" against "FLOORASST"
+# is 0.89.
+_LABEL_THRESHOLD = 0.75
 
-    Loose at the ends on purpose: OCR reads "FUELALLOW" where the template says
-    "FUELALLOWANCE", and normalising drops the trailing underscore that marks a
-    mirror line, so "HTB" also matches "HTB_". That is wanted -- the mirror
-    carries a different ACCOUNT, so the pair still names exactly one line.
+
+def _label_score(annotation_label: Any, line_description: Any) -> float:
+    """How strongly the word beside the account names this template line.
+
+    Not equality. The label is HANDWRITING, and OCR reads the same scrawl
+    differently on different runs: this invoice's FLOORASST came back as
+    "FLOORASST" one run and "FLOORASUT" the next. Requiring an exact match meant
+    the second reading fell through to matching on account number alone, where
+    428.00 landed on the DMA line and the real FLOORASST line picked up a
+    spurious mirror of the line above it.
+
+    Prefixes score just under exact, which covers the ordinary case of OCR
+    reading "FUELALLOW" for "FUELALLOWANCE". Normalising also drops the trailing
+    underscore that marks a mirror line, so "HTB" scores full against "HTB_" --
+    wanted, because the mirror carries a different ACCOUNT and the pair still
+    names exactly one line.
 
     Three characters minimum, so a stray letter cannot match half a template.
     """
     a = _normalise(annotation_label)
     b = _normalise(line_description)
     if len(a) < 3 or len(b) < 3:
-        return False
-    return a == b or a.startswith(b) or b.startswith(a)
+        return 0.0
+    if a == b:
+        return 1.0
+    if a.startswith(b) or b.startswith(a):
+        return 0.95
+    return difflib.SequenceMatcher(None, a, b).ratio()
 
 
 def _annotated_amount(
