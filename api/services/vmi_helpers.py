@@ -450,6 +450,48 @@ def get_gl_annotation_lines(ocr: dict[str, Any]) -> list[GlAnnotation]:
     return lines
 
 
+def get_coded_amounts(ocr: dict[str, Any]) -> list[float]:
+    """Amounts the manufacturer printed in cents, as dollars.
+
+    Schaumburg Honda's invoice states its allowances in a bare run of digits on
+    the MSRP line -- "42800 4400 85590" -- with no decimal point anywhere. The
+    last two digits are the cents, so the rule is simply to divide by 100:
+    428.00, 44.00 and 855.90.
+
+    Two of those three are also written out by hand beside their GL accounts,
+    which is what makes the convention safe to rely on: the handwriting confirms
+    the reading of the row it came from.
+
+    Anything already punctuated is left alone rather than divided -- a figure
+    written "855.90" means 855.90, and treating it as cents would post 8.56.
+    """
+    amounts: list[float] = []
+    for raw in ocr.get("coded_amounts") or []:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        # Anything carrying a letter is a VIN, an engine number or a stock
+        # number, whatever the prompt asked for. Stripping the letters off
+        # 5FNRL6H68TB085198 and reading what is left turns a VIN into
+        # 5,668,085,198, which is why this rejects rather than salvages.
+        if any(c.isalpha() for c in text):
+            continue
+
+        if not text.isdigit():
+            # Already punctuated, so it states its own decimal point: "855.90"
+            # means 855.90, and dividing it by 100 would post 8.56.
+            value = _amount(text)
+            if value is not None and value > 0:
+                amounts.append(round(abs(value), 2))
+            continue
+        # Under three digits cannot carry both cents and a dollar amount, and a
+        # very long run is a serial number that slipped through.
+        if not 3 <= len(text) <= 9:
+            continue
+        amounts.append(round(int(text) / 100.0, 2))
+    return amounts
+
+
 def get_gl_annotation_labels(ocr: dict[str, Any]) -> dict[str, str]:
     """{GL account -> the label OCR says that amount came from}.
 
@@ -517,6 +559,7 @@ def build_facts(ocr: dict[str, Any], dealership_name: str = "") -> VehicleInvoic
         annotated_gl_accounts=get_annotated_gl_accounts(ocr),
         gl_annotations=annotations,
         gl_annotation_lines=get_gl_annotation_lines(ocr),
+        coded_amounts=get_coded_amounts(ocr),
         unpriced_gl_accounts=get_unpriced_gl_accounts(ocr, annotations),
         gl_annotation_labels=get_gl_annotation_labels(ocr),
         prose_sourced_accounts=annotations_read_from_prose(ocr),

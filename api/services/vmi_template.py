@@ -244,6 +244,7 @@ def fill(
     dealer_cost_total: float,
     chart: dict[str, dict[str, Any]] | None = None,
     doc_fee: float | None = None,
+    holdback_fallback: float | None = None,
 ) -> FillResult:
     """Fill one Tekion template from one invoice's annotations.
 
@@ -276,6 +277,15 @@ def fill(
     # plays that role, so a store that annotates them and a store that does not
     # go down the same path.
     holdback = _assigned_to_role(postings, assigned, ROLE_HOLDBACK, chart)
+
+    # An invoice that prints its holdback instead of annotating it. Used ONLY
+    # where the handwriting named no holdback account, so it can never displace
+    # what a person wrote; the caller decides whether such a figure exists and
+    # is unambiguous.
+    holdback_from_page = False
+    if holdback is None and holdback_fallback is not None:
+        holdback = holdback_fallback
+        holdback_from_page = True
 
     # What the vehicle was financed for. The clerk's annotation on the floor
     # plan account wins over anything parsed off the page.
@@ -349,6 +359,12 @@ def fill(
             elif role == ROLE_INVOICE_PRICE and holdback is not None:
                 amount = round(financed - abs(holdback), 2)
                 source = "financed less holdback"
+                roles_filled.add(role)
+            elif role == ROLE_HOLDBACK and holdback_from_page:
+                # Reached only when no annotation named this account: an
+                # annotated holdback line is filled by rule 1 above.
+                amount = abs(holdback)
+                source = "holdback printed on the invoice"
                 roles_filled.add(role)
 
         # 3. A figure the store configured into the template. Schaumburg Ford

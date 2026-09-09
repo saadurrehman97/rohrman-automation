@@ -199,6 +199,11 @@ class VehicleInvoiceFacts:
     # FLOORASST -- against three separate 2248 lines in its template, and the
     # label is the only thing that tells them apart.
     gl_annotation_lines: list[vmi_template.GlAnnotation] = field(default_factory=list)
+    # Amounts the MANUFACTURER printed in cents with no decimal point, already
+    # divided by 100. Honda's "42800 4400 85590" beside MSRP is 428.00, 44.00
+    # and 855.90. Only ever consulted for a template line the handwriting left
+    # empty -- see where the holdback fallback is built.
+    coded_amounts: list[float] = field(default_factory=list)
     # Accounts written on the invoice that OCR could not tie to a figure. Not a
     # detail: an account a person wrote and the system dropped means the entry
     # is short a line, and posting the rest is worse than posting nothing.
@@ -687,6 +692,47 @@ class VehicleJournalEntryService:
 # ── Orchestration ────────────────────────────────────────────────────────────
 
 
+def _holdback_from_coded_row(facts: VehicleInvoiceFacts) -> float | None:
+    """The holdback, for an invoice that prints it instead of annotating it.
+
+    Schaumburg Honda's clerk writes out every account except this one. The
+    figure IS on the page -- "42800 4400 85590" beside MSRP -- but it carries no
+    account number, so nothing above can place it.
+
+    What makes it placeable is the rest of the row. 428.00 and 44.00 are both
+    written out by hand against their accounts, so they are already spoken for;
+    855.90 is the only figure in the row that nothing claims, and the holdback
+    line is the only line left unfilled. One unclaimed figure for one empty
+    line is a match, not a guess.
+
+    Anything less certain returns None and the caller refuses, which is the
+    behaviour every other store already gets:
+      - nothing printed in the row
+      - two or more unclaimed figures, so which one is holdback is unknown
+      - a figure at or above the price of the car, which no holdback ever is
+
+    Only ever reached when the handwriting did NOT name the holdback account, so
+    this cannot displace an annotation at Kia, Ford or Oakbrook Toyota.
+    """
+    if not facts.coded_amounts:
+        return None
+
+    written = {round(abs(a.amount), 2) for a in facts.gl_annotation_lines}
+    unclaimed = [
+        value
+        for value in facts.coded_amounts
+        if value > 0 and round(value, 2) not in written
+    ]
+    if len(unclaimed) != 1:
+        return None
+
+    holdback = unclaimed[0]
+    ceiling = facts.dealer_cost_total or facts.msrp_total
+    if ceiling and holdback >= ceiling:
+        return None
+    return holdback
+
+
 def _role_accounts(
     template: dict[str, Any], roles: list[str], chart: dict[str, dict[str, Any]]
 ) -> list[vmi_template.FilledLine]:
@@ -819,6 +865,7 @@ def create_vehicle_journal_entry(
         facts.dealer_cost_total,
         chart,
         doc_fee=STORE_DOC_FEE.get(dealer_id, DEFAULT_DOC_FEE),
+        holdback_fallback=_holdback_from_coded_row(facts),
     )
 
     # An annotation with nowhere to go is the clearest possible signal that this

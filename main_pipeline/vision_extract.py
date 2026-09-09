@@ -190,6 +190,22 @@ GL ACCOUNTS & SPATIAL BINDING:
     letters and drop leading zeros. When a handwritten GL code points at such a segment, emit
     `{"gl_account": "2245", "amount": "780.00", "mapped_description": "KAC0780KAC"}` -- put the
     code segment verbatim in `mapped_description` so the reading can be checked.
+  - FIGURES PRINTED IN CENTS WITH NO DECIMAL POINT: a vehicle manufacturer invoice often prints a
+    short run of bare digit groups on or beside the MSRP line, with no dollar sign, no comma and
+    no decimal point:
+
+        MSRP $42,795.00      42800   4400   85590
+
+    These are amounts in cents -- 428.00, 44.00 and 855.90 -- and they are the manufacturer's own
+    statement of the allowances and holdback on the car. Copy each one into `coded_amounts[]`
+    EXACTLY as printed, as a digit string, in left-to-right order: `["42800", "4400", "85590"]`.
+    Do not insert the decimal point, do not reorder them and do not drop one because it looks
+    like a duplicate of something written by hand.
+
+    Only bare digit runs belong here. Leave out anything carrying a dollar sign, comma or decimal
+    point (the MSRP itself), and leave out the VIN, engine number, stock number, control number,
+    key code, dealer number, order reference, zip code and phone number. If the invoice has no
+    such run, return an empty array.
   - When a handwritten GL code points instead at a labelled figure in a totals column, use that
     figure and name the label (e.g. `{"gl_account": "3300", "amount": "32133.00",
     "mapped_description": "TOTAL dealer cost"}`).
@@ -250,6 +266,7 @@ def build_response_schema() -> types.Schema:
             "amount": _str(),
             "mapped_description": _str(),
         })),
+        "coded_amounts": _arr(_S(type=_T.STRING)),
         "handwritten_notes": _arr(_S(type=_T.STRING)),
         "illegible": _arr(_S(type=_T.STRING)),
     }, required=["document_type"])
