@@ -190,9 +190,15 @@ class VehicleInvoiceFacts:
     annotated_amounts: dict[str, float] = field(default_factory=dict)
     # GL account numbers written on the invoice, in the order they were found.
     annotated_gl_accounts: list[str] = field(default_factory=list)
-    # The real input: {GL account -> the amount the clerk pointed it at}.
-    # "2245" against KAC0780KAC means 780.00 belongs in holdback receivable.
+    # For display only: {GL account -> amount}. An account written twice keeps
+    # only the last figure, which is why it is not what posts.
     gl_annotations: dict[str, float] = field(default_factory=dict)
+    # THE REAL INPUT. Every account written on the invoice, in reading order,
+    # with the sign that was on the page and the word written beside it.
+    # Schaumburg Honda writes 2248 three times on one invoice -- DMA, HTB and
+    # FLOORASST -- against three separate 2248 lines in its template, and the
+    # label is the only thing that tells them apart.
+    gl_annotation_lines: list[vmi_template.GlAnnotation] = field(default_factory=list)
     # Accounts written on the invoice that OCR could not tie to a figure. Not a
     # detail: an account a person wrote and the system dropped means the entry
     # is short a line, and posting the rest is worse than posting nothing.
@@ -681,6 +687,31 @@ class VehicleJournalEntryService:
 # ── Orchestration ────────────────────────────────────────────────────────────
 
 
+def _role_accounts(
+    template: dict[str, Any], roles: list[str], chart: dict[str, dict[str, Any]]
+) -> list[vmi_template.FilledLine]:
+    """The template lines playing `roles`, so a refusal can name the account."""
+    found: list[vmi_template.FilledLine] = []
+    for p in template.get("postings") or []:
+        number = vmi_template.gl_number_of(p.get("glAccountId"), chart)
+        entry = chart.get(str(p.get("glAccountId"))) or {}
+        role = vmi_template.role_of(
+            p.get("description"), entry.get("account_name"), gl_number=number
+        )
+        if role in roles and not any(f.gl_number == number for f in found):
+            found.append(
+                vmi_template.FilledLine(
+                    gl_number=number,
+                    gl_account_id=str(p.get("glAccountId") or ""),
+                    amount=0.0,
+                    ref_type="",
+                    description=str(p.get("description") or ""),
+                    source=role,
+                )
+            )
+    return found
+
+
 def create_vehicle_journal_entry(
     client: TekionApiClient,
     facts: VehicleInvoiceFacts,
@@ -757,7 +788,11 @@ def create_vehicle_journal_entry(
     print(
         f"[VMI] template {result.tekion_template_name!r} "
         f"(journal {tekion_template.get('journalId')}), "
-        f"annotations {facts.gl_annotations}"
+        "annotations "
+        + ", ".join(
+            f"{a.account}={a.amount:,.2f}" + (f" [{a.label}]" if a.label else "")
+            for a in facts.gl_annotation_lines
+        )
     )
     # The template's own lines. Printed because the captured template list was
     # truncated by the capture's body cap, so this is the only reliable view of
@@ -774,15 +809,13 @@ def create_vehicle_journal_entry(
 
     chart = service.chart_by_account_id()
 
-    # The account written on the invoice goes to the template line with that
-    # account number, for the amount OCR read. Nothing is inferred, reassigned
-    # or second-guessed here: if an amount is wrong it is wrong in the reading,
-    # and correcting it downstream only hides where the fault is.
-    annotations = facts.gl_annotations
-
+    # The account and label written on the invoice go to the template line that
+    # carries them, for the amount OCR read. Nothing is inferred, reassigned or
+    # second-guessed here: if an amount is wrong it is wrong in the reading, and
+    # correcting it downstream only hides where the fault is.
     filled = vmi_template.fill(
         tekion_template,
-        facts.gl_annotations,
+        facts.gl_annotation_lines,
         facts.dealer_cost_total,
         chart,
         doc_fee=STORE_DOC_FEE.get(dealer_id, DEFAULT_DOC_FEE),
@@ -793,12 +826,47 @@ def create_vehicle_journal_entry(
     # money a person explicitly placed.
     if filled.unmatched_annotations:
         pairs = ", ".join(
-            f"{gl}={amount:,.2f}" for gl, amount in filled.unmatched_annotations.items()
+            f"{a.account}={a.amount:,.2f}" + (f" ({a.label})" if a.label else "")
+            for a in filled.unmatched_annotations
         )
         result.refusal = (
             f"the invoice annotates {pairs}, but template "
             f"{result.tekion_template_name!r} has no line for "
             f"{'those accounts' if len(filled.unmatched_annotations) > 1 else 'that account'}"
+        )
+        result.needs = ["gl_annotations"]
+        return result
+
+    # A role the template asks for that nothing filled. Worth its own message:
+    # the holdback line also feeds the invoice-price line computed from it, so
+    # losing it drops TWO lines and the entry fails the balance check further
+    # down with a figure that points nowhere near the cause.
+    #
+    # Schaumburg Honda is the case. Its invoice prints holdback in an unlabelled
+    # coded row beside MSRP -- "42800 4400 85590" -- which OCR does not read and
+    # which nothing should be guessing at. A person types the figure in.
+    _ROLE_LABELS = {
+        vmi_template.ROLE_HOLDBACK: "holdback",
+        vmi_template.ROLE_FLOOR_PLAN: "floor plan",
+        vmi_template.ROLE_INVOICE_PRICE: "invoice price",
+    }
+    dropped = list(filled.dropped_roles)
+    # The invoice price is COMPUTED from the holdback, so a missing holdback
+    # drops it too. Reporting both reads as two independent problems and sends
+    # whoever fixes it looking for a price to type in; there is only one.
+    if vmi_template.ROLE_HOLDBACK in dropped:
+        dropped = [r for r in dropped if r != vmi_template.ROLE_INVOICE_PRICE]
+    if dropped:
+        missing = ", ".join(_ROLE_LABELS.get(role, role) for role in dropped)
+        accounts = ", ".join(
+            line.gl_number
+            for line in _role_accounts(tekion_template, dropped, chart)
+        )
+        result.refusal = (
+            f"no {missing} amount could be read from this invoice, and template "
+            f"{result.tekion_template_name!r} has a line for it"
+            + (f" ({accounts})" if accounts else "")
+            + " -- add the account and amount below and run it again"
         )
         result.needs = ["gl_annotations"]
         return result

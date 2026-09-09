@@ -23,6 +23,7 @@ from typing import Any, Iterator
 
 from api.services import ocr_helpers
 from api.services.vmi_je_creation import VehicleInvoiceFacts, detect_manufacturer
+from api.services.vmi_template import GlAnnotation
 
 # ── Walking the OCR tree ─────────────────────────────────────────────────────
 
@@ -313,8 +314,10 @@ def get_gl_annotations(ocr: dict[str, Any]) -> dict[str, float]:
     KAC0780KAC means 780.00 goes to holdback receivable. The OCR prompt asks for
     these as a `gl_annotations` array; this reads it back.
 
-    Amounts come back positive. Whether a line is a debit or a credit is the
-    template's business, not the annotation's.
+    Amounts come back positive, and an account written more than once keeps only
+    the last figure. Both are fine for DISPLAY, which is all this is for now.
+    The posting logic uses get_gl_annotation_lines() instead, which keeps every
+    occurrence and its sign -- see that function for why that matters.
     """
     found: dict[str, float] = {}
     # gl_mappings[] is the field the vision schema actually defines, and the
@@ -331,6 +334,120 @@ def get_gl_annotations(ocr: dict[str, Any]) -> dict[str, float]:
             continue
         found[account] = abs(amount)
     return found
+
+
+# A note that states an account and the figure beside it:
+#     "2248 641.93 HTB"      -> 2248, +641.93, "HTB"
+#     "3010A -641.93 HTB"    -> 3010A, -641.93, "HTB"
+#     "GL 2245 1129"         -> 2245, +1129.00, ""
+#
+# Anchored at the start so a note that merely CONTAINS numbers is not read as
+# an annotation: "HTB 641.93" and "OBT 7992" both fail here, which is right --
+# the first is a memo of a figure and the second is a stock number.
+_NOTE_GL_LINE = re.compile(
+    r"^\s*(?:GL|G/?L|ACCT|ACCOUNT|A/C)?\s*#?\s*"
+    r"(\d{4,5}[A-Za-z]?)\s+"
+    r"(-\s*)?\$?\s*([\d,]+(?:\.\d{1,2})?)\s*\$?"
+    r"\s*(.*)$",
+    re.IGNORECASE,
+)
+
+
+def _gl_lines_from_notes(ocr: dict[str, Any]) -> list[GlAnnotation]:
+    """Annotations read straight off the transcribed handwriting.
+
+    The structured `gl_mappings` OCR returns drops the minus sign -- it reports
+    "44" for a note that plainly reads "-44" -- and the raw note is the only
+    place the sign survives. Schaumburg Honda writes four negative lines, and
+    posting them positive doubled each pair instead of cancelling it.
+    """
+    found: list[GlAnnotation] = []
+    for raw in ocr.get("handwritten_notes") or []:
+        match = _NOTE_GL_LINE.match(str(raw or ""))
+        if not match:
+            continue
+        amount = _amount(match.group(3))
+        if amount is None:
+            continue
+        negative = bool(match.group(2))
+        found.append(
+            GlAnnotation(
+                account=match.group(1).upper(),
+                amount=-abs(amount) if negative else abs(amount),
+                label=match.group(4).strip(),
+                signed=negative,
+            )
+        )
+    return found
+
+
+def get_gl_annotation_lines(ocr: dict[str, Any]) -> list[GlAnnotation]:
+    """Every account written on the invoice, in order, with sign and label.
+
+    A LIST, not a map. Schaumburg Honda's clerk writes 2248 three times on one
+    invoice -- as DMA, as HTB and as FLOORASST -- because the store's template
+    posts to 2248 three times. Keying by account keeps one of the three.
+
+    `gl_mappings` is the primary reading, since the vision prompt's anchoring
+    rules aim at it. The transcribed notes supply what that structure loses: the
+    minus sign, and the label where OCR reported none. A note naming an account
+    the structured output missed entirely is added rather than dropped.
+    """
+    notes = _gl_lines_from_notes(ocr)
+    claimed: set[int] = set()
+    lines: list[GlAnnotation] = []
+
+    entries = list(ocr.get("gl_mappings") or []) + list(ocr.get("gl_annotations") or [])
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        account = _account_number(entry.get("gl_account"))
+        amount = _amount(entry.get("amount"))
+        if not account or amount is None:
+            continue
+        label = str(entry.get("mapped_description") or entry.get("source") or "").strip()
+
+        # The note that transcribed this same figure, for its sign and label.
+        twin = next(
+            (
+                i
+                for i, note in enumerate(notes)
+                if i not in claimed
+                and note.account == account
+                and round(abs(note.amount), 2) == round(abs(amount), 2)
+            ),
+            None,
+        )
+        if twin is None:
+            lines.append(GlAnnotation(account, abs(amount), label, signed=False))
+            continue
+
+        claimed.add(twin)
+        note = notes[twin]
+        lines.append(
+            GlAnnotation(
+                account=account,
+                amount=note.amount,
+                label=label or note.label,
+                signed=note.signed,
+            )
+        )
+
+    # An account the notes read but the structured output did not. Added only
+    # when that exact account-and-figure is not already present, so the two
+    # readings of one annotation can never become two lines.
+    for i, note in enumerate(notes):
+        if i in claimed:
+            continue
+        if any(
+            line.account == note.account
+            and round(abs(line.amount), 2) == round(abs(note.amount), 2)
+            for line in lines
+        ):
+            continue
+        lines.append(note)
+
+    return lines
 
 
 def get_gl_annotation_labels(ocr: dict[str, Any]) -> dict[str, str]:
@@ -399,6 +516,7 @@ def build_facts(ocr: dict[str, Any], dealership_name: str = "") -> VehicleInvoic
         annotated_amounts=get_annotated_amounts(ocr),
         annotated_gl_accounts=get_annotated_gl_accounts(ocr),
         gl_annotations=annotations,
+        gl_annotation_lines=get_gl_annotation_lines(ocr),
         unpriced_gl_accounts=get_unpriced_gl_accounts(ocr, annotations),
         gl_annotation_labels=get_gl_annotation_labels(ocr),
         prose_sourced_accounts=annotations_read_from_prose(ocr),
@@ -449,10 +567,33 @@ def apply_overrides(facts: VehicleInvoiceFacts, overrides: dict[str, Any]) -> li
         if kind == "gl_map":
             merged = dict(facts.gl_annotations)
             for account, value in (raw or {}).items():
-                account = re.sub(r"[^0-9A-Za-z]", "", str(account))
+                account = re.sub(r"[^0-9A-Za-z]", "", str(account)).upper()
                 amount = _amount(value)
-                if account and amount is not None:
-                    merged[account] = abs(amount)
+                if not account or amount is None:
+                    continue
+                merged[account] = abs(amount)
+
+                # The list is what actually posts, so the correction has to
+                # land there too. An account already on the list is corrected
+                # in place; one that is not is appended, which is the case that
+                # matters -- Schaumburg Honda prints its holdback in a coded row
+                # OCR cannot read, so a person types 2245 and the figure in.
+                #
+                # KNOWN LIMIT: a form sending {account: amount} cannot say WHICH
+                # of three 2248 lines it means, so the first is corrected. A
+                # store needing more than that needs a form that carries labels.
+                existing = next(
+                    (a for a in facts.gl_annotation_lines if a.account == account),
+                    None,
+                )
+                if existing is None:
+                    facts.gl_annotation_lines.append(
+                        GlAnnotation(account=account, amount=abs(amount))
+                    )
+                else:
+                    existing.amount = (
+                        -abs(amount) if existing.amount < 0 else abs(amount)
+                    )
             if merged != facts.gl_annotations:
                 facts.gl_annotations = merged
                 changed.append(key)

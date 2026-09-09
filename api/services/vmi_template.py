@@ -34,6 +34,30 @@ MIRROR LINES
     against DMA_ -150.00. The trailing underscore is the convention. When the
     first of a pair is filled from an annotation, its mirror follows with the
     sign flipped, because nobody writes the same number twice on an invoice.
+
+WHY AN ACCOUNT NUMBER IS NOT ENOUGH TO IDENTIFY A LINE
+    This module used to take {account -> amount}, which assumes each account
+    appears once. Schaumburg Honda disproves it. Its template posts to 2248
+    three times -- as DMA, as HTB, and as FLOORASST -- and to 2320 twice, once
+    for the vehicle and once for the DOC fee. The clerk writes 2248 three times
+    too, with a different figure each time.
+
+    A dictionary keeps the last of those and drops the rest, so an invoice
+    carrying 150 / 641.93 / 428 against 2248 posted 428 three times and came out
+    39,052.78 short.
+
+    The template already says which is which: its `description` field holds the
+    very words the clerk writes beside the number -- "DMA", "HTB", "FLOORASST",
+    "FUELALLOWANCE" -- and OCR returns that word in `mapped_description`. So an
+    annotation is (account, amount, label) and the join is on the PAIR, with the
+    account alone as the fallback for the stores that annotate without labels.
+
+SIGNS
+    The magnitude is the clerk's; the direction is usually the template's. But
+    where a template line has no preset to take a sign from and plays no role,
+    the minus sign on the page is the only evidence there is -- "3010A -641.93"
+    is a credit and posting it as a debit is how the HTB and FLOORASST pairs
+    both came out doubled instead of cancelling.
 """
 from __future__ import annotations
 
@@ -157,6 +181,29 @@ def gl_number_of(gl_account_id: Any, chart: dict[str, dict[str, Any]] | None = N
     return key.split("_", 1)[1] if "_" in key else key
 
 
+# ── What the clerk wrote ─────────────────────────────────────────
+
+
+@dataclass
+class GlAnnotation:
+    """One account written on the invoice, with the figure beside it.
+
+    A LIST of these, not a dict: the same account is written more than once on
+    invoices whose template posts to it more than once. See the module header.
+    """
+
+    account: str
+    # Signed exactly as written. -641.93 means a minus sign was on the page.
+    amount: float
+    # The word written beside it: "HTB", "FLOORASST", "DMA". This is what tells
+    # three 2248 annotations apart, and it matches the template line's own
+    # description because both come from the same store vocabulary.
+    label: str = ""
+    # Whether that minus sign was actually read, as opposed to the amount simply
+    # arriving positive. Only an explicit minus is allowed to set a direction.
+    signed: bool = False
+
+
 # ── Result of filling one template ───────────────────────────────────────────
 
 
@@ -177,16 +224,23 @@ class FilledLine:
 @dataclass
 class FillResult:
     lines: list[FilledLine] = field(default_factory=list)
-    # Accounts the clerk annotated that the template has no line for. Not fatal
-    # on its own, but it means the entry will not carry money the person
-    # intended to place, so callers should refuse rather than post a short one.
-    unmatched_annotations: dict[str, float] = field(default_factory=dict)
+    # Annotations the template has no line for. Not fatal on its own, but it
+    # means the entry will not carry money the person intended to place, so
+    # callers should refuse rather than post a short one.
+    #
+    # A list, not a dict, for the same reason annotations are: two leftover
+    # annotations on the same account are two separate problems.
+    unmatched_annotations: list[GlAnnotation] = field(default_factory=list)
+    # Roles the template asks for that nothing could fill. A dropped holdback
+    # line also silently drops the invoice-price line computed from it, so the
+    # caller needs to name the real cause rather than report an imbalance.
+    dropped_roles: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 
 def fill(
     template: dict[str, Any],
-    annotations: dict[str, float],
+    annotations: list[GlAnnotation],
     dealer_cost_total: float,
     chart: dict[str, dict[str, Any]] | None = None,
     doc_fee: float | None = None,
@@ -195,25 +249,33 @@ def fill(
 
     `template` is a raw template object from
     POST /api/accounting/u/v2/transaction/upc/templates.
-    `annotations` maps a GL account number to the positive amount written
-    against it. `chart` maps glAccountId to the account's own record, and is
-    what turns a template line's opaque id into the number the clerk wrote.
-    `doc_fee` is the store's internal DOC fee, which appears on no invoice.
+    `annotations` is what the clerk wrote, in reading order. `chart` maps
+    glAccountId to the account's own record, and is what turns a template line's
+    opaque id into the number the clerk wrote. `doc_fee` is the store's internal
+    DOC fee, which appears on no invoice.
     """
     result = FillResult()
     postings = template.get("postings") or []
-    used: set[str] = set()
-    # Roles are one-shot: see the note where they are applied.
     roles_filled: set[str] = set()
 
-    # A template line's sign is carried by its preset amount where it has one,
-    # and by its role otherwise. Mirror lines are matched by their partner's
-    # description with a trailing underscore, which is the Tekion convention.
     by_description: dict[str, list[dict[str, Any]]] = {}
     for p in postings:
         by_description.setdefault(str(p.get("description") or ""), []).append(p)
 
-    holdback = annotations.get(_account_for_role(postings, ROLE_HOLDBACK, chart), None)
+    # WHICH ANNOTATION GOES ON WHICH LINE, decided up front.
+    #
+    # Deciding it inside the line loop is what the account-keyed dict did, and
+    # it cannot work: the loop reaches 2320 "Vehicle Invoice Price" before it
+    # reaches the 2320 DOC-fee line, so the DOC-fee annotation landed on the
+    # invoice-price line and destroyed both.
+    assigned, leftover = _assign(postings, annotations, chart)
+    result.unmatched_annotations = leftover
+
+    # The figure the holdback line takes, and the one the invoice price is
+    # computed from. Both are read off whatever was assigned to the line that
+    # plays that role, so a store that annotates them and a store that does not
+    # go down the same path.
+    holdback = _assigned_to_role(postings, assigned, ROLE_HOLDBACK, chart)
 
     # What the vehicle was financed for. The clerk's annotation on the floor
     # plan account wins over anything parsed off the page.
@@ -224,10 +286,7 @@ def fill(
     # for one line and from a parsed total for another is how Ford came out
     # 1,727.30 apart: the annotation said 45,267.70 and the totals block was
     # read as 46,995.00, the MSRP on the same row.
-    #
-    # dealer_cost_total remains the fallback for an invoice whose floor plan
-    # line carries no annotation.
-    financed = annotations.get(_account_for_role(postings, ROLE_FLOOR_PLAN, chart))
+    financed = _assigned_to_role(postings, assigned, ROLE_FLOOR_PLAN, chart)
     if financed is None:
         financed = dealer_cost_total
     financed = abs(financed) if financed else 0.0
@@ -245,10 +304,7 @@ def fill(
                     doc_fee_by_index[i - 1] = abs(doc_fee)
                 break
 
-    # Which lines took their amount straight from the handwriting. A mirror
-    # follows an ANNOTATED line only -- never a line that was itself mirrored,
-    # or the whole tail of a template would fill itself in alternating signs.
-    annotated_index: set[int] = set()
+    dropped: list[str] = []
 
     for index, p in enumerate(postings):
         gl = gl_number_of(p.get("glAccountId"), chart)
@@ -260,19 +316,14 @@ def fill(
 
         amount: float | None = None
         source = ""
+        annotation = assigned.get(index)
 
-        # 1. Written on the invoice against this exact account.
-        #
-        # The annotation supplies the MAGNITUDE only. Sign belongs to the line,
-        # not to the handwriting: a clerk writes "3300 -> 32,133.00" beside the
-        # total, but the floor plan account is credited, and taking the written
-        # number at face value posted it as a debit and threw the entry out by
-        # twice the price of the car.
-        if gl in annotations:
-            amount = abs(annotations[gl]) * _sign_for(role, preset)
-            source = f"annotated {gl}"
-            used.add(gl)
-            annotated_index.add(index)
+        # 1. Written on the invoice against this line.
+        if annotation is not None:
+            amount = _annotated_amount(annotation, role, preset)
+            source = f"annotated {annotation.account}"
+            if annotation.label:
+                source += f" ({annotation.label})"
             # An annotated line still CONSUMES its role. Without this, 3300
             # taking the floor plan from the handwriting left the floor-plan
             # role unclaimed, and Oakbrook Toyota's "8041 FLOOR PLAN ASST." --
@@ -296,7 +347,7 @@ def fill(
                 source = "amount financed (credit)"
                 roles_filled.add(role)
             elif role == ROLE_INVOICE_PRICE and holdback is not None:
-                amount = round(financed - holdback, 2)
+                amount = round(financed - abs(holdback), 2)
                 source = "financed less holdback"
                 roles_filled.add(role)
 
@@ -326,38 +377,27 @@ def fill(
         # mirror to follow a mirror would walk the rest of the template filling
         # in alternating signs: at Schaumburg Kia that would have put +290 into
         # CUSTOMER WE OWE, which has nothing to do with this invoice.
-        elif (index - 1) in annotated_index:
-            partner = postings[index - 1]
-            partner_gl = gl_number_of(partner.get("glAccountId"), chart)
-            if partner_gl in annotations:
-                amount = -abs(annotations[partner_gl]) * _sign_for(
-                    role_of(
-                        partner.get("description"),
-                        _account_name(partner.get("glAccountId"), chart),
-                        gl_number=partner_gl,
-                    ),
-                    partner.get("amount"),
-                )
-                source = f"mirrors {partner_gl}"
+        elif (index - 1) in assigned:
+            amount = -_partner_amount(postings[index - 1], assigned[index - 1], chart)
+            source = f"mirrors {assigned[index - 1].account}"
 
         # 6. The older named-pair convention: "DMA_" follows "DMA".
         elif description.endswith("_") and description[:-1] in by_description:
             partner = by_description[description[:-1]][0]
-            partner_gl = gl_number_of(partner.get("glAccountId"), chart)
-            if partner_gl in annotations:
+            partner_index = postings.index(partner)
+            if partner_index in assigned:
                 # The mirror always opposes its partner, which is the whole
                 # point of the pair: DMA 150.00 against DMA_ -150.00.
-                amount = -abs(annotations[partner_gl]) * _sign_for(
-                    role_of(
-                        partner.get("description"),
-                        _account_name(partner.get("glAccountId"), chart),
-                        gl_number=partner_gl,
-                    ),
-                    partner.get("amount"),
-                )
-                source = f"mirrors {partner_gl}"
+                amount = -_partner_amount(partner, assigned[partner_index], chart)
+                source = f"mirrors {assigned[partner_index].account}"
 
         if amount is None or round(amount, 2) == 0.0:
+            # A role line nothing could fill is worth naming. A missing holdback
+            # also silently drops the invoice-price line computed from it, and
+            # the caller reporting "the entry does not balance" sends whoever
+            # reads it looking two lines further down than the actual cause.
+            if role and role not in roles_filled and role not in dropped:
+                dropped.append(role)
             continue
 
         result.lines.append(
@@ -372,10 +412,178 @@ def fill(
             )
         )
 
-    result.unmatched_annotations = {
-        gl: amount for gl, amount in annotations.items() if gl not in used
-    }
+    result.dropped_roles = dropped
     return result
+
+
+# ── Matching annotations to template lines ─────────────────────────────
+
+
+def _assign(
+    postings: list[dict[str, Any]],
+    annotations: list[GlAnnotation],
+    chart: dict[str, dict[str, Any]] | None,
+) -> tuple[dict[int, GlAnnotation], list[GlAnnotation]]:
+    """Decide which template line each annotation fills.
+
+    Two passes, and the order matters. Every annotation that carries a LABEL
+    claims its line first, so an unlabelled one cannot take a line a labelled
+    one was going to need.
+
+    Returns (template index -> annotation, annotations with nowhere to go).
+    """
+    numbers = [gl_number_of(p.get("glAccountId"), chart) for p in postings]
+    assigned: dict[int, GlAnnotation] = {}
+
+    # Pass 1: account AND label. The template's description is the store's own
+    # word for the line -- "HTB", "FLOORASST" -- and the clerk writes that same
+    # word on the page, which is the only thing that tells three 2248s apart.
+    unlabelled: list[GlAnnotation] = []
+    for annotation in annotations:
+        hit = next(
+            (
+                i
+                for i, p in enumerate(postings)
+                if i not in assigned
+                and numbers[i] == annotation.account
+                and _label_matches(annotation.label, p.get("description"))
+            ),
+            None,
+        )
+        if hit is None:
+            unlabelled.append(annotation)
+        else:
+            assigned[hit] = annotation
+
+    # Pass 2: account number alone, which is how every store that annotates
+    # without labels has always worked.
+    leftover: list[GlAnnotation] = []
+    for annotation in unlabelled:
+        candidates = [
+            i
+            for i in range(len(postings))
+            if i not in assigned and numbers[i] == annotation.account
+        ]
+        if not candidates:
+            leftover.append(annotation)
+            continue
+        assigned[_pick(candidates, postings, annotation, chart)] = annotation
+
+    return assigned, leftover
+
+
+def _pick(
+    candidates: list[int],
+    postings: list[dict[str, Any]],
+    annotation: GlAnnotation,
+    chart: dict[str, dict[str, Any]] | None,
+) -> int:
+    """Which of several lines on the same account an unlabelled annotation means.
+
+    Honda lists 2320 twice: the vehicle's inventory line at zero, and the DOC
+    fee line preset to 380.00. "2320 380" written on the page means the second,
+    and the store having typed 380 into that line is the evidence for it --
+    taking the first instead overwrote the invoice price with the DOC fee.
+    """
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # A line the store already configured to this exact figure.
+    for i in candidates:
+        preset = postings[i].get("amount")
+        if preset and round(abs(float(preset)), 2) == round(abs(annotation.amount), 2):
+            return i
+
+    # Otherwise leave the computed lines alone: holdback, floor plan and
+    # invoice price are derived from the invoice total, and an annotation that
+    # did not name one of them should not land on one.
+    for i in candidates:
+        number = gl_number_of(postings[i].get("glAccountId"), chart)
+        if not role_of(
+            postings[i].get("description"),
+            _account_name(postings[i].get("glAccountId"), chart),
+            gl_number=number,
+        ):
+            return i
+
+    return candidates[0]
+
+
+def _label_matches(annotation_label: Any, line_description: Any) -> bool:
+    """Whether the word beside the account is this template line's own word.
+
+    Loose at the ends on purpose: OCR reads "FUELALLOW" where the template says
+    "FUELALLOWANCE", and normalising drops the trailing underscore that marks a
+    mirror line, so "HTB" also matches "HTB_". That is wanted -- the mirror
+    carries a different ACCOUNT, so the pair still names exactly one line.
+
+    Three characters minimum, so a stray letter cannot match half a template.
+    """
+    a = _normalise(annotation_label)
+    b = _normalise(line_description)
+    if len(a) < 3 or len(b) < 3:
+        return False
+    return a == b or a.startswith(b) or b.startswith(a)
+
+
+def _annotated_amount(
+    annotation: GlAnnotation, role: str, preset: float | None
+) -> float:
+    """The signed amount an annotated line posts.
+
+    The magnitude is always the clerk's. The direction belongs to the role where
+    the line has one -- a clerk writes "3300 -> 32,133.00" beside the total but
+    the floor plan is credited, and taking that at face value threw the entry
+    out by twice the price of the car.
+
+    Failing a role, the minus sign ON THE PAGE decides. Honda's template leaves
+    HTB_ and FLOORASST_ at zero, so there is no preset to take a direction from,
+    and the "-641.93" the clerk wrote is the only evidence there is.
+    """
+    if role in _ROLE_SIGN:
+        return abs(annotation.amount) * _ROLE_SIGN[role]
+    if annotation.signed:
+        return annotation.amount
+    if preset:
+        return abs(annotation.amount) * (-1.0 if preset < 0 else 1.0)
+    return abs(annotation.amount)
+
+
+def _partner_amount(
+    partner: dict[str, Any],
+    annotation: GlAnnotation,
+    chart: dict[str, dict[str, Any]] | None,
+) -> float:
+    """What the annotated line above posted, so its mirror can oppose it."""
+    number = gl_number_of(partner.get("glAccountId"), chart)
+    role = role_of(
+        partner.get("description"),
+        _account_name(partner.get("glAccountId"), chart),
+        gl_number=number,
+    )
+    preset = partner.get("amount")
+    return _annotated_amount(
+        annotation, role, None if preset is None else round(float(preset), 2)
+    )
+
+
+def _assigned_to_role(
+    postings: list[dict[str, Any]],
+    assigned: dict[int, GlAnnotation],
+    role: str,
+    chart: dict[str, dict[str, Any]] | None,
+) -> float | None:
+    """The amount written against the first template line playing `role`."""
+    for i, p in enumerate(postings):
+        number = gl_number_of(p.get("glAccountId"), chart)
+        if role_of(
+            p.get("description"),
+            _account_name(p.get("glAccountId"), chart),
+            gl_number=number,
+        ) == role:
+            annotation = assigned.get(i)
+            return None if annotation is None else annotation.amount
+    return None
 
 
 # Roles whose direction is fixed by what the account is for, whatever the
