@@ -197,6 +197,9 @@ class VehicleInvoiceFacts:
     # What OCR says each amount was read from ("PPO RESERVE"). Used to check
     # the pairing against the account's own name -- see repair_by_label.
     gl_annotation_labels: dict[str, str] = field(default_factory=dict)
+    # Accounts whose amount was pulled out of a sentence rather than off a
+    # labelled figure. Refused rather than posted -- see the guard below.
+    prose_sourced_accounts: list[str] = field(default_factory=list)
 
     def amount(self, key: str) -> float | None:
         value = self.annotated_amounts.get(key)
@@ -695,6 +698,17 @@ def create_vehicle_journal_entry(
         result.refusal = "no stock number on the invoice (write it on before uploading)"
         result.needs = ["stock_number"]
         return result
+    if facts.prose_sourced_accounts:
+        accounts = ", ".join(facts.prose_sourced_accounts)
+        result.refusal = (
+            f"the amounts for {accounts} were read out of a sentence on the invoice, "
+            "and that reading has been wrong every time -- it lands a line below "
+            "where the arrow points. Enter the amounts here, or write them beside "
+            "the accounts on the invoice as \"GL 2245 1129.00\""
+        )
+        result.needs = ["gl_annotations"]
+        return result
+
     if facts.unpriced_gl_accounts:
         accounts = ", ".join(facts.unpriced_gl_accounts)
         result.refusal = (

@@ -380,6 +380,7 @@ def build_facts(ocr: dict[str, Any], dealership_name: str = "") -> VehicleInvoic
         gl_annotations=annotations,
         unpriced_gl_accounts=get_unpriced_gl_accounts(ocr, annotations),
         gl_annotation_labels=get_gl_annotation_labels(ocr),
+        prose_sourced_accounts=annotations_read_from_prose(ocr),
     )
 
 
@@ -460,6 +461,37 @@ def apply_overrides(facts: VehicleInvoiceFacts, overrides: dict[str, Any]) -> li
     if changed:
         print(f"[VMI] manual overrides applied: {', '.join(changed)}")
     return changed
+
+
+# Wording that means the figure came out of a sentence rather than off a
+# labelled line or a written "GL <account> <amount>" pair.
+#
+# Reading an arrow into a paragraph has been wrong every time it has been tried
+# on a Toyota reserve line: the transcribed span comes back one line lower than
+# the arrow actually points, so 2245 takes the wholesale finance figure and 2250
+# takes the PPO one, and the entry balances anyway. Balancing is what makes it
+# dangerous -- nothing downstream can tell.
+_PROSE_SPAN_HINTS = (
+    "whichincludes",
+    "dealerreceives",
+    "reserveof",
+    "inaddition",
+    "thisinvoice",
+)
+
+
+def annotations_read_from_prose(ocr: dict[str, Any]) -> list[str]:
+    """Accounts whose amount was taken out of a sentence, not a labelled figure.
+
+    Returns the accounts involved so the caller can refuse and say which. An
+    empty list means every amount came from somewhere unambiguous.
+    """
+    from_prose: list[str] = []
+    for account, label in get_gl_annotation_labels(ocr).items():
+        flat = _normalise(label)
+        if any(hint in flat for hint in _PROSE_SPAN_HINTS):
+            from_prose.append(account)
+    return from_prose
 
 
 def get_unpriced_gl_accounts(ocr: dict[str, Any], priced: dict[str, float]) -> list[str]:
