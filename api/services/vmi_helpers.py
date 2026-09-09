@@ -419,7 +419,15 @@ def get_gl_annotation_lines(ocr: dict[str, Any]) -> list[GlAnnotation]:
             None,
         )
         if twin is None:
-            lines.append(GlAnnotation(account, abs(amount), label, signed=False))
+            # The prompt asks for a positive figure here and direction is
+            # decided downstream, so a minus arriving anyway is not noise -- it
+            # means the model saw one on the page. Honour it, since without a
+            # matching note this is the only place the sign could survive.
+            lines.append(
+                GlAnnotation(account, amount, label, signed=amount < 0)
+                if amount < 0
+                else GlAnnotation(account, abs(amount), label, signed=False)
+            )
             continue
 
         claimed.add(twin)
