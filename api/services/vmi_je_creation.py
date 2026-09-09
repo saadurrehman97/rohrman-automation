@@ -102,12 +102,15 @@ _TEMPLATES_PATH = "/api/accounting/u/v2/transaction/upc/templates"
 # "NEW VEHICLE" and "2024 HONDA PROLOGUE". Journal number alone does not
 # identify one there, so name the intended template per dealer here. Without an
 # entry the flow refuses and lists the candidates rather than picking one.
-# Empty, and it should stay that way unless a store genuinely keeps two
-# journal-70 templates. An entry was briefly added here for 1707/"NEW VEHICLE"
-# on the belief that it was Schaumburg Kia's; it was Schaumburg Honda's, seen
-# only because the dealer switch above was missing. Schaumburg Kia has exactly
-# one journal-70 template, "BILL".
-TEMPLATE_PREFERENCE: dict[str, str] = {}
+# Add a store only when it genuinely keeps two journal-70 templates. An entry
+# was once made here for 1707 while processing a KIA invoice, because the dealer
+# switch above was missing and Kia was reading Honda's templates; Schaumburg Kia
+# has exactly one journal-70 template, "BILL", and needs no entry.
+TEMPLATE_PREFERENCE: dict[str, str] = {
+    # Schaumburg Honda. "2024 HONDA PROLOGUE" is a template for that one model;
+    # an ordinary new-vehicle invoice belongs on "NEW VEHICLE".
+    "1707": "NEW VEHICLE",
+}
 
 # The internal DOC fee, per dealership. It is not printed on the invoice, not
 # annotated, and not preset in every store's template -- Schaumburg Honda has it
