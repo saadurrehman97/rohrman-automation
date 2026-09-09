@@ -282,6 +282,21 @@ def get_annotated_amounts(ocr: dict[str, Any]) -> dict[str, float]:
     return found
 
 
+# The account number inside whatever a clerk wrote. "GL 2245", "GL# 2250",
+# "gl 8041" and a bare "2245" all name the same thing, and the label is written
+# by hand so its shape varies by person and by day.
+#
+# The digits must stand alone. A stock number like OBT7992 has no word boundary
+# before its digits, so it cannot be mistaken for account 7992 -- which matters,
+# because a stock number sits on every one of these invoices.
+_ACCOUNT_IN_TEXT = re.compile(r"\b(\d{4,5}[A-Za-z]?)\b")
+
+
+def _account_number(text: Any) -> str:
+    match = _ACCOUNT_IN_TEXT.search(str(text or ""))
+    return match.group(1).upper() if match else ""
+
+
 def get_gl_annotations(ocr: dict[str, Any]) -> dict[str, float]:
     """Handwritten GL account -> the amount the clerk pointed it at.
 
@@ -302,11 +317,9 @@ def get_gl_annotations(ocr: dict[str, Any]) -> dict[str, float]:
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        account = re.sub(r"[^0-9A-Za-z]", "", str(entry.get("gl_account") or ""))
+        account = _account_number(entry.get("gl_account"))
         amount = _amount(entry.get("amount"))
-        # A 4-5 digit account is the shape every Rohrman GL uses; anything else
-        # is a stock number or a dealer code that drifted into the array.
-        if not re.fullmatch(r"\d{4,5}[A-Za-z]?", account) or amount is None:
+        if not account or amount is None:
             continue
         found[account] = abs(amount)
     return found
@@ -325,7 +338,7 @@ def get_gl_annotation_labels(ocr: dict[str, Any]) -> dict[str, str]:
     for entry in list(ocr.get("gl_mappings") or []) + list(ocr.get("gl_annotations") or []):
         if not isinstance(entry, dict):
             continue
-        account = re.sub(r"[^0-9A-Za-z]", "", str(entry.get("gl_account") or ""))
+        account = _account_number(entry.get("gl_account"))
         label = str(entry.get("mapped_description") or entry.get("source") or "").strip()
         if account and label:
             labels[account] = label

@@ -160,8 +160,15 @@ GL ACCOUNTS & SPATIAL BINDING:
     beside it, that is the clerk stating how the invoice divides. It may be circled, boxed, in a
     margin, at the foot of the page, or just written plainly with nothing around it -- the layout
     does not matter and there is no need for it to look like a block. What identifies it is an
-    account number followed by an amount. Capture EVERY such pair in `gl_mappings[]`, one entry
-    each, with the amount exactly as written:
+    account number followed by an amount. The commonest form is a short list written in open
+    space on the page:
+
+        GL 2245    1129$
+        GL 2250     368$
+
+    There is no limit to how many lines such a list has, and the prefix varies -- "GL", "GL#",
+    "gl", or nothing at all before the number. Capture EVERY such pair in `gl_mappings[]`, one
+    entry each, with the amount exactly as written:
 
         GL# 7193   $2,378.11        -> {"gl_account": "7193", "amount": "2378.11", ...}
         GL# 3142   $202.12          -> {"gl_account": "3142", "amount": "202.12", ...}
