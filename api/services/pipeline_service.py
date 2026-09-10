@@ -103,9 +103,9 @@ EX_VENDOR_NOT_FOUND = "VENDOR_NOT_FOUND"
 # Vendor stock orders are invoiced against an existing PO. If the number on the
 # invoice does not resolve, there is nothing to attach to.
 EX_PO_NOT_FOUND = "PO_NOT_FOUND"
-# The PO named on the invoice exists, but cannot be invoiced -- cancelled,
-# or already carrying this very invoice number.
-EX_PO_UNUSABLE = "PO_UNUSABLE"
+# The PO named on the invoice exists but cannot take it. The specific code
+# comes from po_reuse.blocking() -- PO_ALREADY_INVOICED or PO_CLOSED -- so
+# the message a person reads names the actual cause.
 EX_AMOUNT_MISMATCH = "AMOUNT_MISMATCH"
 EX_UNBALANCED = "UNBALANCED_ENTRY"
 # The parts read off an invoice do not add up to its total. Either OCR misread
@@ -798,13 +798,13 @@ def _resolve_existing_po(
     session.add(doc)
     session.commit()
 
-    blocked = po_reuse.blocking_reason(found, doc.invoice_number)
+    blocked_code, blocked = po_reuse.blocking(found, doc.invoice_number)
 
     if choice == po_reuse.CHOICE_EXISTING:
         if blocked:
             # The PO changed between being offered and being chosen, or someone
             # invoiced it in the meantime. Refusing beats posting anyway.
-            _fail(session, doc, EX_PO_UNUSABLE, error=blocked)
+            _fail(session, doc, blocked_code, error=blocked)
             return None, True
         print(f"[PIPE] {doc.id} reusing {po_reuse.describe(found)}")
         return found.raw, False
@@ -812,7 +812,7 @@ def _resolve_existing_po(
     if blocked:
         # Nothing to ask: neither answer would help. A new PO is not the fix for
         # an invoice that has already been posted against this one.
-        _fail(session, doc, EX_PO_UNUSABLE, error=blocked)
+        _fail(session, doc, blocked_code, error=blocked)
         return None, True
 
     job_queue.hold_for_po_decision(

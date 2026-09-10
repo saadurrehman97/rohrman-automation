@@ -52,6 +52,13 @@ _DEAD_STATUSES = {"CANCELLED", "CANCELED", "VOIDED", "CLOSED"}
 CHOICE_EXISTING = "EXISTING"
 CHOICE_NEW = "NEW"
 
+# Why a PO that exists still cannot take this invoice. Two codes rather than
+# one, because the headline a person reads should name the actual cause: "this
+# PO already has this invoice" and "this PO is cancelled" call for different
+# next steps, and a single code forced the UI to describe both at once.
+BLOCK_ALREADY_INVOICED = "PO_ALREADY_INVOICED"
+BLOCK_CLOSED = "PO_CLOSED"
+
 
 @dataclass
 class FoundPo:
@@ -176,8 +183,8 @@ def look_up(client: Any, po_number: str) -> FoundPo | None:
     )
 
 
-def blocking_reason(found: FoundPo, invoice_number: str) -> str:
-    """Why this PO cannot take this invoice, or "" if it can.
+def blocking(found: FoundPo, invoice_number: str) -> tuple[str, str]:
+    """Why this PO cannot take this invoice: (code, message), or ("", "") if it can.
 
     Two things stop it, and they are different in kind:
 
@@ -195,10 +202,13 @@ def blocking_reason(found: FoundPo, invoice_number: str) -> str:
     spelling out the consequence there as well said it twice.
     """
     if found.is_dead:
-        return f"PO {found.po_number} is {found.status.lower()}"
+        return BLOCK_CLOSED, f"PO {found.po_number} is {found.status.lower()}"
     if found.carries(invoice_number):
-        return f"PO {found.po_number} already has invoice {invoice_number}"
-    return ""
+        return (
+            BLOCK_ALREADY_INVOICED,
+            f"PO {found.po_number} already has invoice {invoice_number}",
+        )
+    return "", ""
 
 
 def describe(found: FoundPo) -> str:
