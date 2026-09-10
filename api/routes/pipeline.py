@@ -34,9 +34,10 @@ from api.models.schemas import (
     MessageResponse,
     PipelineAcceptedResponse,
     PipelineStatusResponse,
+    PoDecisionRequest,
     RerunRequest,
 )
-from api.services import job_queue, pipeline_service, s3_service
+from api.services import job_queue, po_reuse, pipeline_service, s3_service
 from api.services.pipeline_service import VALID_FOLDERS, normalize_folder
 
 router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
@@ -185,6 +186,39 @@ def discard_duplicate(
     return MessageResponse(message="Duplicate discarded")
 
 
+@router.post("/jobs/{document_id}/po-decision", response_model=PipelineStatusResponse)
+def decide_purchase_order(
+    document_id: UUID,
+    payload: PoDecisionRequest,
+    session: Annotated[Session, Depends(get_session)],
+) -> PipelineStatusResponse:
+    """Say whether to invoice the existing purchase order or raise a new one.
+
+    The document is held in PO_DECISION because it names a PO that already
+    exists in Tekion, and posting against an order somebody else raised is not
+    a call the pipeline makes on its own.
+
+    The choice applies to THIS run only. A later upload of the same invoice is
+    asked again rather than inheriting a decision made about different
+    paperwork.
+    """
+    doc = session.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.status != job_queue.STATUS_PO_DECISION:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Document is {doc.status}, not awaiting a purchase order decision",
+        )
+
+    choice = (
+        po_reuse.CHOICE_EXISTING
+        if payload.choice == "existing"
+        else po_reuse.CHOICE_NEW
+    )
+    return _to_status(job_queue.resolve_po_decision(session, doc, choice), session=session)
+
+
 @router.post("/jobs/{document_id}/rerun", response_model=PipelineStatusResponse)
 def rerun_document(
     document_id: UUID,
@@ -302,6 +336,7 @@ def _to_status(
         journal_id=doc.journal_id,
         ocr_document_type=doc.ocr_document_type,
         duplicate_of=doc.duplicate_of,
+        po_candidate=_as_json_object(doc.po_candidate) or None,
         manual_fields=_as_json_object(doc.manual_fields),
         vehicle_details=_as_json_object(doc.vehicle_details),
         needs_fields=[

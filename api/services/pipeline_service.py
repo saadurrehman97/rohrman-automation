@@ -42,7 +42,13 @@ from sqlmodel import Session
 
 from api.db import engine
 from api.models.db import Document
-from api.services import document_splitter, job_queue, ocr_helpers, s3_service
+from api.services import (
+    document_splitter,
+    job_queue,
+    ocr_helpers,
+    po_reuse,
+    s3_service,
+)
 from api.services.ocr_service import extract_document
 from api.services.tekion_lock import dealer_scope, tekion_scope
 
@@ -97,6 +103,9 @@ EX_VENDOR_NOT_FOUND = "VENDOR_NOT_FOUND"
 # Vendor stock orders are invoiced against an existing PO. If the number on the
 # invoice does not resolve, there is nothing to attach to.
 EX_PO_NOT_FOUND = "PO_NOT_FOUND"
+# The PO named on the invoice exists, but cannot be invoiced -- cancelled,
+# or already carrying this very invoice number.
+EX_PO_UNUSABLE = "PO_UNUSABLE"
 EX_AMOUNT_MISMATCH = "AMOUNT_MISMATCH"
 EX_UNBALANCED = "UNBALANCED_ENTRY"
 # The parts read off an invoice do not add up to its total. Either OCR misread
@@ -721,6 +730,101 @@ def _run_stock_pre_invoice(
 # ── SUBLET / MISCELLANEOUS -> Purchase order ─────────────────────────────────
 
 
+def _resolve_existing_po(
+    doc: Document,
+    ocr: dict[str, Any],
+    session: Session,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Decide whether this invoice should reuse a purchase order already in Tekion.
+
+    Returns (existing_po, stop). `existing_po` is a PO to invoice instead of
+    creating one; `stop` means this run is over -- the document has been parked
+    for a decision or failed -- and the caller must return without posting.
+
+    THE ORDER OF THE QUESTIONS, and why each one exits early:
+
+      1. Is a PO number written on the invoice? No number means the invoice is
+         not referring to an existing order at all, and the normal flow is
+         simply right. This is the common case and costs one regex.
+
+      2. Did a person already answer for this run? "Create a new one" means
+         they looked and said no; honour it without asking twice. The answer is
+         consumed here, so a later upload is asked again.
+
+      3. Does that PO exist at THIS dealership? Only an exact match counts --
+         Tekion's search is fuzzy, and a near-miss must not be treated as the
+         PO the clerk meant.
+
+      4. Can it take this invoice? A cancelled PO cannot, and a PO already
+         carrying this invoice number must not. The second is not covered by
+         the duplicate check upstream: that catches a repeat of a document WE
+         processed, while this catches a PO invoiced in Tekion by hand, which
+         nothing in our own records would show.
+
+      5. Otherwise, ask. Nothing here decides on its own to post against an
+         order somebody else raised.
+    """
+    from api.routes.tekion import _resolve_dealer, get_client
+
+    if doc.po_type not in (FOLDER_SUBLET, FOLDER_MISC):
+        return None, False
+
+    po_number = ocr_helpers.get_po_number(ocr)
+    if not po_number:
+        return None, False
+
+    choice = (doc.po_choice or "").upper()
+    if choice:
+        # Consumed whichever way it went, so it applies to this attempt only.
+        doc.po_choice = ""
+        session.add(doc)
+        session.commit()
+
+    if choice == po_reuse.CHOICE_NEW:
+        print(f"[PIPE] {doc.id} PO {po_number} exists but a new one was requested")
+        return None, False
+
+    # The lookup is per-dealership, so the switch has to happen first.
+    with tekion_scope():
+        client = get_client(session)
+        _resolve_dealer(client, doc.dealership_name)
+        found = po_reuse.look_up(client, po_number)
+
+    if found is None:
+        print(f"[PIPE] {doc.id} PO {po_number!r} is not in Tekion -- creating a new one")
+        return None, False
+
+    doc.po_number = found.po_number or po_number
+    session.add(doc)
+    session.commit()
+
+    blocked = po_reuse.blocking_reason(found, doc.invoice_number)
+
+    if choice == po_reuse.CHOICE_EXISTING:
+        if blocked:
+            # The PO changed between being offered and being chosen, or someone
+            # invoiced it in the meantime. Refusing beats posting anyway.
+            _fail(session, doc, EX_PO_UNUSABLE, error=blocked)
+            return None, True
+        print(f"[PIPE] {doc.id} reusing {po_reuse.describe(found)}")
+        return found.raw, False
+
+    if blocked:
+        # Nothing to ask: neither answer would help. A new PO is not the fix for
+        # an invoice that has already been posted against this one.
+        _fail(session, doc, EX_PO_UNUSABLE, error=blocked)
+        return None, True
+
+    job_queue.hold_for_po_decision(
+        session,
+        doc,
+        found,
+        f"The invoice names {po_reuse.describe(found)}, which already exists in "
+        f"Tekion. Use it, or create a new purchase order?",
+    )
+    return None, True
+
+
 def _run_purchase_order(
     doc: Document,
     ocr: dict[str, Any],
@@ -788,6 +892,10 @@ def _run_purchase_order(
         "invoice_file_path": source_path,
     }
 
+    existing_po, stop = _resolve_existing_po(doc, ocr, session)
+    if stop:
+        return
+
     try:
         if doc.po_type == FOLDER_SUBLET:
             # Sublet invoices do not carry a trustworthy RO number, so the RO
@@ -797,6 +905,18 @@ def _run_purchase_order(
             # against the invoice's line-item descriptions by the LLM, using
             # the job's captured concern + tech story text — the OCR'd RO
             # number is no longer used at all.
+            #
+            # None of it applies to a PO somebody else already raised: that PO
+            # carries its own RO and job, and searching for another would at
+            # best find the same one and at worst fail the document over a step
+            # its outcome does not depend on.
+            if existing_po:
+                req = CreateSubletPoRequest(**common, line_items=[])
+                with tekion_scope():
+                    response = _create_sublet_po(req, session, existing_po=existing_po)
+                _finish_purchase_order(doc, response, session)
+                return
+
             if not doc.vin:
                 _fail(session, doc, EX_MISSING_FIELD, error="sublet with no VIN")
                 return
@@ -890,7 +1010,7 @@ def _run_purchase_order(
                 ],
             )
             with tekion_scope():
-                response = _create_misc_po(req, session)
+                response = _create_misc_po(req, session, existing_po=existing_po)
 
     except HTTPException as e:
         # An HTTPException here is Tekion (or our own validation) saying no:
@@ -912,11 +1032,22 @@ def _run_purchase_order(
         _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         return
 
+    _finish_purchase_order(doc, response, session)
+
+
+def _finish_purchase_order(doc: Document, response: Any, session: Session) -> None:
+    """Record the outcome of a PO run, however the PO was arrived at.
+
+    Shared by the create path and the reuse path so the two cannot drift: a
+    reused PO is PROCESSED on exactly the same terms as one we raised.
+    """
     if not response.success:
         _fail(session, doc, EX_TEKION_ERROR, error=response.error or "PO creation failed")
         return
 
-    doc.po_number = response.po_number or ""
+    # `or doc.po_number` for the reuse path: the number was recorded when the
+    # PO was found, and a response that omits it should not blank it.
+    doc.po_number = response.po_number or doc.po_number or ""
     doc.vendor_name = response.vendor_name or doc.vendor_name
     job_queue.complete(session, doc)
     print(f"[PIPE] {doc.id} -> PROCESSED (PO {doc.po_number})")

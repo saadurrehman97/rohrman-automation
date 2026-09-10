@@ -160,6 +160,15 @@ def _clean_po_number(raw: Any) -> str:
     return stripped or text
 
 
+# A purchase order number a person wrote on the page: "PO 35096", "P.O. #35096".
+# The label is what separates it from every other number on the invoice, and
+# "PO BOX" is excluded because it appears in most vendor addresses.
+_WRITTEN_PO = re.compile(
+    r"\bP\.?\s*O\.?(?!\s*BOX)\s*(?:NUMBER|NO|#)?\s*[#:.-]?\s*([A-Za-z0-9-]{3,20})\b",
+    re.IGNORECASE,
+)
+
+
 def get_po_number(ocr: dict[str, Any]) -> str:
     """The purchase order number printed on the invoice.
 
@@ -198,7 +207,23 @@ def get_po_number(ocr: dict[str, Any]) -> str:
     if found:
         return found
 
-    return _clean_po_number(ocr.get("po_number") or ocr.get("poNumber") or "")
+    found = _clean_po_number(ocr.get("po_number") or ocr.get("poNumber") or "")
+    if found:
+        return found
+
+    # Written on by hand. The prompt asks for these in identifiers[] too, but a
+    # margin scribble is the case OCR is least consistent about structuring, and
+    # the raw transcription is where it always survives.
+    #
+    # A LABEL IS REQUIRED here -- unlike the printed path, which trusts the
+    # field's own name. A note is just text on a page: scanning it for bare
+    # digits would return the RO number, the account number or the date.
+    for note in ocr.get("handwritten_notes") or []:
+        match = _WRITTEN_PO.search(str(note or ""))
+        if match:
+            return _clean_po_number(match.group(1))
+
+    return ""
 
 
 

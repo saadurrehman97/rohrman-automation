@@ -6,6 +6,8 @@ from enum import Enum
 from typing import Annotated, Any, Literal, Union
 from uuid import UUID
 
+from typing import Any
+
 from pydantic import BaseModel, Field, EmailStr
 
 
@@ -381,6 +383,16 @@ class PipelineFolder(str, Enum):
     VEHICLE_MANUFACTURING = "VEHICLE_MANUFACTURING"
 
 
+class PoDecisionRequest(BaseModel):
+    """Which purchase order to invoice against.
+
+    "existing" invoices the PO already in Tekion; "new" raises a fresh one, the
+    behaviour before this check existed. Honoured for one run either way.
+    """
+
+    choice: Literal["existing", "new"]
+
+
 class RerunRequest(BaseModel):
     """Corrections to apply before running a refused document again.
 
@@ -433,6 +445,11 @@ class PipelineStatusResponse(BaseModel):
     ocr_document_type: str = Field(default="", alias="ocrDocumentType")
     # Set when status is DUPLICATE: the already-processed document this repeats.
     duplicate_of: UUID | None = Field(default=None, alias="duplicateOf")
+    # Set when status is PO_DECISION: the purchase order this invoice names,
+    # which already exists in Tekion. Carries its number, vendor, total, status
+    # and the invoices already on it, so the choice can be made without opening
+    # Tekion and without this endpoint calling it.
+    po_candidate: dict[str, Any] | None = Field(default=None, alias="poCandidate")
     # What a person typed in on a previous re-run, so the form comes back filled
     # rather than blank on the second correction.
     manual_fields: dict[str, Any] = Field(default_factory=dict, alias="manualFields")

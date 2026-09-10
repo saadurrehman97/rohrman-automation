@@ -190,6 +190,14 @@ GL ACCOUNTS & SPATIAL BINDING:
     letters and drop leading zeros. When a handwritten GL code points at such a segment, emit
     `{"gl_account": "2245", "amount": "780.00", "mapped_description": "KAC0780KAC"}` -- put the
     code segment verbatim in `mapped_description` so the reading can be checked.
+  - A PURCHASE ORDER NUMBER WRITTEN ON BY HAND: staff often write the PO number the invoice
+    should be billed against in a margin or at the top of the page -- "PO 35096", "P.O. #35096",
+    or just "35096" beside the word PO. Put it in `identifiers[]` as
+    `{"label": "Purchase Order", "value": "35096"}`, exactly as a printed one would be, AND leave
+    it in `handwritten_notes[]` as well. It is the same fact whether it was typed or written.
+
+    Do NOT report the vendor's postal "PO BOX" as a purchase order number, and do not invent one
+    from an invoice number, account number or RO number that happens to sit near the word PO.
   - FIGURES PRINTED IN CENTS WITH NO DECIMAL POINT: a vehicle manufacturer invoice often prints a
     short run of bare digit groups on or beside the MSRP line, with no dollar sign, no comma and
     no decimal point:

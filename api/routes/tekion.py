@@ -186,15 +186,28 @@ def create_po(
 def _create_sublet_po(
     req: CreateSubletPoRequest,
     session: Session,
+    existing_po: dict | None = None,
 ) -> CreatePoResponse:
+    """Raise a sublet PO and pre-invoice it.
+
+    `existing_po` reuses a purchase order already in Tekion instead of creating
+    one -- see api/services/po_reuse.py. Everything after the PO is identical
+    either way, which is the point: the reuse path is not a second
+    implementation of pre-invoicing that can drift from this one.
+    """
     try:
         client = get_client(session)
         dealer_id = _resolve_dealer(client, req.dealership_name)
         vendor = _resolve_vendor(client, dealer_id, req.vendor_name, session)
 
         # Build sublet items — each line item has its own RO + job.
+        #
+        # Skipped entirely when reusing: the items describe a PO to be CREATED,
+        # and the one we are invoicing already has its own. Skipping also avoids
+        # the RO-by-VIN search, which is the most failure-prone step in this
+        # flow and has nothing to say about a PO somebody else raised.
         items: list[dict] = []
-        for li in req.line_items:
+        for li in req.line_items if not existing_po else []:
             ros = client.search_ro(li.ro_number)
             if not ros:
                 raise HTTPException(
@@ -233,27 +246,36 @@ def _create_sublet_po(
                 }
             )
 
-        # If no line items, we still need an RO — require at least one.
-        if not items:
-            raise HTTPException(
-                status_code=422,
-                detail="Sublet PO requires at least one line item with an RO number",
-            )
+        if existing_po:
+            po = existing_po
+        else:
+            # If no line items, we still need an RO — require at least one.
+            if not items:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Sublet PO requires at least one line item with an RO number",
+                )
 
-        po = client.create_sublet_po(
-            vendor_id=int(vendor["id"]),
-            vendor_name=vendor["name"],
-            vendor_display_id=vendor["displayId"],
-            vendor_site_id=vendor["siteId"],
-            vendor_phone=vendor["phone"],
-            vendor_email=vendor["email"],
-            items=items,
-        )
+            po = client.create_sublet_po(
+                vendor_id=int(vendor["id"]),
+                vendor_name=vendor["name"],
+                vendor_display_id=vendor["displayId"],
+                vendor_site_id=vendor["siteId"],
+                vendor_phone=vendor["phone"],
+                vendor_email=vendor["email"],
+                items=items,
+            )
 
         # Pre-invoice — GL 2460 for sublet, AP GL 3002.
         gl_account_id = f"{dealer_id}_2460"
         ap_gl_account_id = f"{dealer_id}_3002"
-        ref_text = req.line_items[0].ro_number
+        # The control the pre-invoice carries. Normally the RO the sublet was
+        # raised against; for a reused PO that RO is the one already on it.
+        ref_text = (
+            req.line_items[0].ro_number
+            if req.line_items
+            else str(po.get("controlNumber") or "")
+        )
 
         # Upload invoice document if provided.
         attachment_media_ids: list[str] = []
@@ -299,7 +321,15 @@ def _create_sublet_po(
 def _create_misc_po(
     req: CreateMiscPoRequest,
     session: Session,
+    existing_po: dict | None = None,
 ) -> CreatePoResponse:
+    """Raise a misc PO and pre-invoice it.
+
+    `existing_po` reuses a purchase order already in Tekion instead of creating
+    one -- see api/services/po_reuse.py. The GL work below is unchanged either
+    way: which accounts the invoice hits is a property of the invoice, not of
+    who raised the order it pays.
+    """
     try:
         client = get_client(session)
         dealer_id = _resolve_dealer(client, req.dealership_name)
@@ -318,15 +348,18 @@ def _create_misc_po(
         else:
             items = [{"description": "Misc purchase", "qty": 1, "price": req.invoice_amount}]
 
-        po = client.create_misc_po(
-            vendor_id=vendor["id"],
-            vendor_name=vendor["name"],
-            vendor_display_id=vendor["displayId"],
-            vendor_site_id=vendor["siteId"],
-            vendor_phone=vendor["phone"],
-            vendor_email=vendor["email"],
-            items=items,
-        )
+        if existing_po:
+            po = existing_po
+        else:
+            po = client.create_misc_po(
+                vendor_id=vendor["id"],
+                vendor_name=vendor["name"],
+                vendor_display_id=vendor["displayId"],
+                vendor_site_id=vendor["siteId"],
+                vendor_phone=vendor["phone"],
+                vendor_email=vendor["email"],
+                items=items,
+            )
 
         # Pre-invoice — use OCR-extracted GL accounts if present, else LLM fallback.
         ap_gl_account_id = f"{dealer_id}_3002"

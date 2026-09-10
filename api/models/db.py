@@ -154,12 +154,17 @@ class Document(SQLModel, table=True):
     transaction_id: str = Field(default="", max_length=50)
     transaction_number: str = Field(default="", max_length=50)
     journal_id: str = Field(default="", max_length=50)
-    # QUEUED, PROCESSING, PROCESSED, EXCEPTION, DUPLICATE, AUTO_RESOLVED
+    # QUEUED, PROCESSING, PROCESSED, EXCEPTION, DUPLICATE, PO_DECISION,
+    # AUTO_RESOLVED
     # (PENDING is retained for rows created before the queue existed.)
     #
     # DUPLICATE is a decision point, not a failure: OCR matched an invoice that
     # was already processed, so the run is held until someone confirms or
     # discards it. Nothing was sent to Tekion.
+    #
+    # PO_DECISION is the same idea for a different question: the invoice names a
+    # purchase order that already exists in Tekion, and whether to use it or
+    # raise a new one is a person's call. Nothing was sent to Tekion.
     status: str = Field(default="QUEUED", max_length=20, index=True)
     # VENDOR_NOT_FOUND, PO_MISMATCH, AMOUNT_MISMATCH, LOW_OCR_CONFIDENCE, etc.
     exception_type: str | None = Field(default=None, max_length=100)
@@ -199,6 +204,15 @@ class Document(SQLModel, table=True):
     # duplicate should be reprocessed anyway; cleared as soon as it is honoured,
     # so a later upload is still checked normally.
     duplicate_override: bool = Field(default=False)
+
+    # ── Reusing an existing purchase order (SUBLET / MISCELLANEOUS) ───────────
+    # What the PO lookup found, as JSON: number, vendor, total, status and the
+    # invoices already on it. Stored so the queue can show the choice without
+    # going back to Tekion, and so resuming does not look it up twice.
+    po_candidate: str = Field(default="", max_length=2000)
+    # EXISTING or NEW -- what a person chose. Honoured for exactly one run and
+    # then cleared, like duplicate_override, so a later upload is asked again.
+    po_choice: str = Field(default="", max_length=20)
 
     # ── Batch scans ───────────────────────────────────────────────────────────
     # Several invoices scanned into one file are split into one document each.
