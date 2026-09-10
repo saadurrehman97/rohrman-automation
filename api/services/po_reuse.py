@@ -197,16 +197,20 @@ def blocking(found: FoundPo, invoice_number: str) -> tuple[str, str]:
     catches a PO that was invoiced in Tekion directly, by a person, which
     nothing in our own records would show.
 
-    Kept to the bare fact -- "PO 33147 already has invoice 0016978". This is
-    read in a dialog next to a general explanation of the same thing, and
-    spelling out the consequence there as well said it twice.
+    Short, but it names Tekion. "PO 33147 already has invoice 0016978" left the
+    reader to work out WHERE that PO is -- on the invoice in front of them, or
+    in the system. It is in Tekion, and that is the whole point of the check.
     """
     if found.is_dead:
-        return BLOCK_CLOSED, f"PO {found.po_number} is {found.status.lower()}"
+        return (
+            BLOCK_CLOSED,
+            f"PO {found.po_number} exists in Tekion but is {found.status.lower()}",
+        )
     if found.carries(invoice_number):
         return (
             BLOCK_ALREADY_INVOICED,
-            f"PO {found.po_number} already has invoice {invoice_number}",
+            f"PO {found.po_number} already exists in Tekion with invoice "
+            f"{invoice_number} on it",
         )
     return "", ""
 
