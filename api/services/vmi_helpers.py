@@ -336,49 +336,22 @@ def get_gl_annotations(ocr: dict[str, Any]) -> dict[str, float]:
     return found
 
 
-# A note that states an account and the figure beside it:
-#     "2248 641.93 HTB"      -> 2248, +641.93, "HTB"
-#     "3010A -641.93 HTB"    -> 3010A, -641.93, "HTB"
-#     "GL 2245 1129"         -> 2245, +1129.00, ""
-#
-# Anchored at the start so a note that merely CONTAINS numbers is not read as
-# an annotation: "HTB 641.93" and "OBT 7992" both fail here, which is right --
-# the first is a memo of a figure and the second is a stock number.
-_NOTE_GL_LINE = re.compile(
-    r"^\s*(?:GL|G/?L|ACCT|ACCOUNT|A/C)?\s*#?\s*"
-    r"(\d{4,5}[A-Za-z]?)\s+"
-    r"(-\s*)?\$?\s*([\d,]+(?:\.\d{1,2})?)\s*\$?"
-    r"\s*(.*)$",
-    re.IGNORECASE,
-)
-
-
 def _gl_lines_from_notes(ocr: dict[str, Any]) -> list[GlAnnotation]:
     """Annotations read straight off the transcribed handwriting.
 
-    The structured `gl_mappings` OCR returns drops the minus sign -- it reports
-    "44" for a note that plainly reads "-44" -- and the raw note is the only
-    place the sign survives. Schaumburg Honda writes four negative lines, and
-    posting them positive doubled each pair instead of cancelling it.
+    The parsing lives in ocr_helpers.gl_notes because every flow needs it: the
+    minus sign only survives in the raw note, and Misc, VSO and OEM lose it in
+    exactly the same way the vehicle flow did.
     """
-    found: list[GlAnnotation] = []
-    for raw in ocr.get("handwritten_notes") or []:
-        match = _NOTE_GL_LINE.match(str(raw or ""))
-        if not match:
-            continue
-        amount = _amount(match.group(3))
-        if amount is None:
-            continue
-        negative = bool(match.group(2))
-        found.append(
-            GlAnnotation(
-                account=match.group(1).upper(),
-                amount=-abs(amount) if negative else abs(amount),
-                label=match.group(4).strip(),
-                signed=negative,
-            )
+    return [
+        GlAnnotation(
+            account=note["account"],
+            amount=note["amount"],
+            label=note["label"],
+            signed=note["signed"],
         )
-    return found
+        for note in ocr_helpers.gl_notes(ocr)
+    ]
 
 
 def get_gl_annotation_lines(ocr: dict[str, Any]) -> list[GlAnnotation]:

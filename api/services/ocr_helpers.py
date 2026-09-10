@@ -537,6 +537,57 @@ def get_raw_line_items(ocr: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+# A handwritten note that states an account and the figure beside it:
+#     "GL# 2410 $414.00"    -> 2410,  +414.00
+#     "GL# 6777 -$62.10"    -> 6777,   -62.10
+#     "2248 641.93 HTB"     -> 2248,  +641.93, labelled HTB
+#
+# Anchored at the start so a note that merely CONTAINS numbers is not read as
+# an annotation: "HTB 641.93" and "OBT 7992" both fail here, which is right --
+# the first is a memo of a figure and the second is a stock number.
+_NOTE_GL_LINE = re.compile(
+    r"^\s*(?:GL|G/?L|ACCT|ACCOUNT|A/C)?\s*#?\s*"
+    r"(\d{4,5}[A-Za-z]?)\s+"
+    r"(-\s*)?\$?\s*([\d,]+(?:\.\d{1,2})?)\s*\$?"
+    r"\s*(.*)$",
+    re.IGNORECASE,
+)
+
+
+def gl_notes(ocr: dict[str, Any]) -> list[dict[str, Any]]:
+    """Accounts and amounts read straight off the transcribed handwriting.
+
+    THE SIGN LIVES HERE AND NOWHERE ELSE. The vision prompt asks for a POSITIVE
+    figure in `gl_mappings` and leaves debit/credit to be decided downstream, so
+    a clerk who writes "GL# 6777 -$62.10" gets 62.10 back from the structured
+    output. The raw note is the only place that minus survives, and without it
+    a discount posts as a charge -- which is how a Honda parts invoice came out
+    $124.20 over, exactly twice the discount.
+
+    Returns [{"account", "amount" (signed), "label", "signed"}] in the order the
+    notes were read. `signed` records whether a minus was actually on the page,
+    as opposed to the amount simply arriving positive.
+    """
+    found: list[dict[str, Any]] = []
+    for raw in ocr.get("handwritten_notes") or []:
+        match = _NOTE_GL_LINE.match(str(raw or ""))
+        if not match:
+            continue
+        amount = _parse_amount(match.group(3))
+        if amount is None:
+            continue
+        negative = bool(match.group(2))
+        found.append(
+            {
+                "account": match.group(1).upper(),
+                "amount": -abs(amount) if negative else abs(amount),
+                "label": match.group(4).strip(),
+                "signed": negative,
+            }
+        )
+    return found
+
+
 def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
     """GL accounts written on the invoice WITH the amount each one takes.
 
@@ -555,6 +606,9 @@ def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
     is the older style where a code sits beside a row and the split has to be
     worked out from the rows themselves.
     """
+    notes = gl_notes(ocr)
+    claimed: set[int] = set()
+
     splits: list[dict[str, Any]] = []
     for mapping in ocr.get("gl_mappings") or []:
         if not isinstance(mapping, dict):
@@ -563,12 +617,37 @@ def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
         amount = _parse_amount(mapping.get("amount"))
         # An account with no amount is the older style and belongs to the
         # per-line path; taking it here would post a zero split.
-        if account and amount:
-            splits.append(
-                {
-                    "gl_account": account,
-                    "amount": round(amount, 2),
-                    "description": str(mapping.get("mapped_description") or "") or None,
-                }
-            )
+        if not account or not amount:
+            continue
+
+        # The transcription of this same figure, for its sign. gl_mappings
+        # reports a positive amount whatever the page says -- see gl_notes --
+        # so a discount written "-$62.10" arrives here as a charge unless the
+        # note is consulted.
+        twin = next(
+            (
+                i
+                for i, note in enumerate(notes)
+                if i not in claimed
+                and note["account"] == account.upper()
+                and round(abs(note["amount"]), 2) == round(abs(amount), 2)
+            ),
+            None,
+        )
+        if twin is not None:
+            claimed.add(twin)
+            amount = notes[twin]["amount"]
+        elif amount < 0:
+            # A minus that came through the structured output anyway means the
+            # model saw one; the prompt asking for positives does not make it
+            # noise.
+            pass
+
+        splits.append(
+            {
+                "gl_account": account,
+                "amount": round(amount, 2),
+                "description": str(mapping.get("mapped_description") or "") or None,
+            }
+        )
     return splits
