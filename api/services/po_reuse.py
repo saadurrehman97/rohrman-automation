@@ -189,16 +189,15 @@ def blocking_reason(found: FoundPo, invoice_number: str) -> str:
     duplicate check upstream catches a repeat of a document WE processed; this
     catches a PO that was invoiced in Tekion directly, by a person, which
     nothing in our own records would show.
+
+    Kept to the bare fact -- "PO 33147 already has invoice 0016978". This is
+    read in a dialog next to a general explanation of the same thing, and
+    spelling out the consequence there as well said it twice.
     """
     if found.is_dead:
-        return (
-            f"PO {found.po_number} is {found.status.upper()} and cannot be invoiced"
-        )
+        return f"PO {found.po_number} is {found.status.lower()}"
     if found.carries(invoice_number):
-        return (
-            f"PO {found.po_number} already carries invoice {invoice_number} "
-            f"-- posting again would bill the vendor twice"
-        )
+        return f"PO {found.po_number} already has invoice {invoice_number}"
     return ""
 
 

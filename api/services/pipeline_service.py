@@ -819,8 +819,9 @@ def _resolve_existing_po(
         session,
         doc,
         found,
-        f"The invoice names {po_reuse.describe(found)}, which already exists in "
-        f"Tekion. Use it, or create a new purchase order?",
+        # The card beside this spells out the choice; the row only needs to say
+        # which PO it is about.
+        po_reuse.describe(found),
     )
     return None, True
 
