@@ -417,6 +417,15 @@ def _run(doc: Document, session: Session) -> None:
             job_queue.hold_as_duplicate(session, doc, duplicate)
             return
 
+    # ── 4b. Deleted while it was running ─────────────────────────────────────
+    # OCR takes tens of seconds, so there is a real window between claiming a
+    # document and posting it. Someone deleting it in that window means stop --
+    # the claim check cannot help, because the row was already claimed.
+    session.refresh(doc)
+    if doc.deleted_at is not None:
+        print(f"[PIPE] {doc.id} deleted while processing -- nothing posted")
+        return
+
     # ── 5. Dispatch on the folder ────────────────────────────────────────────
     if doc.po_type == FOLDER_VMI:
         _run_vehicle_journal_entry(doc, ocr, session)

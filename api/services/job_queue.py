@@ -67,6 +67,10 @@ def claim_next(session: Session, worker_id: str) -> Document | None:
         select(Document)
         .where(
             Document.status == STATUS_QUEUED,
+            # Deleted while it sat in the queue. Nothing has been posted yet,
+            # and posting it now would be the one thing the person who deleted
+            # it was trying to prevent.
+            Document.deleted_at.is_(None),  # type: ignore[union-attr]
             (Document.next_attempt_at.is_(None))  # type: ignore[union-attr]
             | (Document.next_attempt_at <= _utcnow()),  # type: ignore[operator]
         )
@@ -340,6 +344,47 @@ def requeue_stale(session: Session) -> int:
     return len(stale)
 
 
+def soft_delete(session: Session, doc: Document, user_id: Any = None) -> Document:
+    """Take a document out of view without destroying it.
+
+    Nothing is undone. A PO that was created stays created and an invoice that
+    posted stays posted -- this is a list being tidied, not a reversal, and
+    pretending otherwise would be worse than leaving the row visible.
+
+    What it does stop is future work: a document still QUEUED will not be picked
+    up, and it no longer blocks a re-upload as a duplicate.
+    """
+    doc.deleted_at = _utcnow()
+    doc.deleted_by_id = user_id
+    # Release the queue lock if it holds one, so a crashed worker's sweep does
+    # not later resurrect it.
+    doc.locked_at = None
+    doc.locked_by = ""
+    doc.next_attempt_at = None
+    session.add(doc)
+    session.commit()
+    session.refresh(doc)
+    print(f"[QUEUE] {doc.id} -> deleted (kept on record)")
+    return doc
+
+
+def restore(session: Session, doc: Document) -> Document:
+    """Put a deleted document back in view, in the state it was left in.
+
+    Deliberately does NOT re-queue it. The row comes back saying what it said
+    before -- processed, refused, held -- and whoever restored it decides what
+    to do next. Re-running on restore would post to Tekion as a side effect of
+    un-hiding a row.
+    """
+    doc.deleted_at = None
+    doc.deleted_by_id = None
+    session.add(doc)
+    session.commit()
+    session.refresh(doc)
+    print(f"[QUEUE] {doc.id} -> restored ({doc.status})")
+    return doc
+
+
 def find_duplicate(session: Session, doc: Document) -> Document | None:
     """An earlier document that already produced this same work.
 
@@ -355,6 +400,11 @@ def find_duplicate(session: Session, doc: Document) -> Document | None:
                 Document.file_hash == doc.file_hash,
                 Document.id != doc.id,
                 Document.status == STATUS_PROCESSED,
+                # A deleted record is not something to collide with: deleting it
+                # and uploading it again is how a person corrects a bad run, and
+                # holding the new one as a duplicate of the discarded one would
+                # make that impossible.
+                Document.deleted_at.is_(None),  # type: ignore[union-attr]
             )
         ).first()
         if same_file:
@@ -366,6 +416,7 @@ def find_duplicate(session: Session, doc: Document) -> Document | None:
                 Document.invoice_number == doc.invoice_number,
                 Document.dealership_name == doc.dealership_name,
                 Document.po_type == doc.po_type,
+                Document.deleted_at.is_(None),  # type: ignore[union-attr]
                 Document.id != doc.id,
                 Document.status == STATUS_PROCESSED,
             )

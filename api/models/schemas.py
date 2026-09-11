@@ -474,6 +474,8 @@ class PipelineStatusResponse(BaseModel):
     uploaded_by: str = Field(default="", alias="uploadedBy")
     created_at: datetime = Field(alias="createdAt")
     processed_at: datetime | None = Field(default=None, alias="processedAt")
+    # Set when the document was deleted. Kept on record, shown greyed out.
+    deleted_at: datetime | None = Field(default=None, alias="deletedAt")
 
     model_config = {"populate_by_name": True}
 
@@ -550,6 +552,10 @@ class DocumentItem(BaseModel):
     # repeats. Exposed on the list so the table can pair them up and offer the
     # decision without opening each row.
     duplicate_of: UUID | None = None
+    # Set when the row was deleted. It stays in the list, greyed out -- the
+    # record is kept, it is only taken out of the way.
+    deleted_at: datetime | None = None
+    deleted_by: str = ""
     file_name: str
     dealership_name: str
     vendor_name: str

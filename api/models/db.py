@@ -178,6 +178,23 @@ class Document(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow, index=True)
     processed_at: datetime | None = Field(default=None)
 
+    # ── Soft delete ───────────────────────────────────────────────────────────
+    # Removed from view, kept on record. A document that reached Tekion is part
+    # of the audit trail whether or not anyone wants it in the list, and the
+    # OCR, the corrections and the PO number it produced are the only account of
+    # what happened.
+    #
+    # The timestamp IS the flag -- NULL means live. A separate boolean could
+    # disagree with it, and then neither would be trustworthy.
+    deleted_at: datetime | None = Field(default=None, index=True)
+    deleted_by_id: UUID | None = Field(
+        default=None, foreign_key="users.id"
+    )
+
+    @property
+    def is_deleted(self) -> bool:
+        return self.deleted_at is not None
+
     # ── Queue bookkeeping ─────────────────────────────────────────────────────
     # This table doubles as the job queue: workers claim rows with
     # SELECT ... FOR UPDATE SKIP LOCKED, so status lives in one place and the

@@ -186,6 +186,51 @@ def discard_duplicate(
     return MessageResponse(message="Duplicate discarded")
 
 
+@router.delete("/jobs/{document_id}", response_model=PipelineStatusResponse)
+def delete_document(
+    document_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+    current_user: CurrentUserDep,
+) -> PipelineStatusResponse:
+    """Take a document out of view. The record is kept.
+
+    Nothing that already happened is undone: a purchase order that was created
+    stays created and an invoice that posted stays posted. Tekion is not called.
+
+    What it does stop is future work -- a document still waiting in the queue
+    will not be picked up, and it no longer blocks a re-upload as a duplicate,
+    which is what makes "delete it and try again" work.
+
+    Deleting an already-deleted document is not an error; it is already in the
+    state the caller asked for.
+    """
+    doc = session.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.deleted_at is None:
+        job_queue.soft_delete(session, doc, user_id=current_user.id)
+    return _to_status(doc, session=session)
+
+
+@router.post("/jobs/{document_id}/restore", response_model=PipelineStatusResponse)
+def restore_document(
+    document_id: UUID,
+    session: Annotated[Session, Depends(get_session)],
+) -> PipelineStatusResponse:
+    """Put a deleted document back in view, in the state it was left in.
+
+    It is NOT re-queued. The row comes back saying what it said before, and
+    whoever restored it decides what to do next -- re-running as a side effect
+    of un-hiding a row would post to Tekion without anyone asking.
+    """
+    doc = session.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.deleted_at is not None:
+        job_queue.restore(session, doc)
+    return _to_status(doc, session=session)
+
+
 @router.post("/jobs/{document_id}/po-decision", response_model=PipelineStatusResponse)
 def decide_purchase_order(
     document_id: UUID,
@@ -352,4 +397,5 @@ def _to_status(
         uploaded_by=uploaded_by,
         created_at=doc.created_at,
         processed_at=doc.processed_at,
+        deleted_at=doc.deleted_at,
     )
