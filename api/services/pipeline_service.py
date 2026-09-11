@@ -444,6 +444,57 @@ def _run(doc: Document, session: Session) -> None:
 # ── OEM -> Journal entry ──────────────────────────────────────────────────────
 
 
+def _record_postings(
+    doc: Document,
+    session: Session,
+    *,
+    lines: list[dict[str, Any]],
+    reference: str = "",
+    balance: float | None = None,
+) -> None:
+    """Record the accounting lines this document put into Tekion.
+
+    One shape for all five flows, so a single component can render any of them:
+
+        {"lines": [{glAccount, glName, amount, control, source}],
+         "creditTotal", "debitTotal", "balance", "reference"}
+
+    Credits and debits are derived from the SIGN rather than taken on trust.
+    Every flow already carries a credit as a negative amount -- that is what
+    Tekion is sent -- so totalling the signs here cannot disagree with what was
+    posted, whereas a separate pair of totals could.
+
+    Written on failures too. A refused entry is exactly when someone wants to
+    see which lines were built and where they stopped adding up.
+    """
+    clean = [
+        {
+            "glAccount": str(line.get("glAccount") or ""),
+            "glName": str(line.get("glName") or ""),
+            "amount": round(float(line.get("amount") or 0), 2),
+            "control": str(line.get("control") or ""),
+            "source": str(line.get("source") or ""),
+        }
+        for line in lines
+        if line.get("glAccount")
+    ]
+    credit = round(sum(-l["amount"] for l in clean if l["amount"] < 0), 2)
+    debit = round(sum(l["amount"] for l in clean if l["amount"] > 0), 2)
+
+    doc.posting_details = json.dumps(
+        {
+            "lines": clean,
+            "creditTotal": credit,
+            "debitTotal": debit,
+            "balance": round(debit - credit, 2) if balance is None else round(balance, 2),
+            "reference": reference,
+        },
+        default=str,
+    )[:8000]
+    session.add(doc)
+    session.commit()
+
+
 def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> None:
     """Parts Manufacture Ticket -> journal entry, saved as a draft."""
     from api.routes.tekion import get_client, reset_client
@@ -491,6 +542,23 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         reset_client()
         _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         return
+
+    _record_postings(
+        doc,
+        session,
+        lines=[
+            {
+                "glAccount": p.get("_glAccountNumber"),
+                "glName": p.get("_glAccountName") or p.get("refText"),
+                "amount": p.get("amount"),
+                "control": result.control_number or "",
+                "source": result.debit_gl_source or "",
+            }
+            for p in result.postings
+        ],
+        reference=result.transaction_number or result.reference or "",
+        balance=result.balance,
+    )
 
     # Checked before `balanced`: a refused entry never got as far as balancing,
     # so "balance $0.00" would be a confusing thing to show someone.
@@ -615,6 +683,23 @@ def _run_vehicle_journal_entry(
     session.add(doc)
     session.commit()
 
+    _record_postings(
+        doc,
+        session,
+        lines=[
+            {
+                "glAccount": p.get("_glAccountNumber"),
+                "glName": p.get("description"),
+                "amount": p.get("amount"),
+                "control": p.get("_control"),
+                "source": p.get("_source"),
+            }
+            for p in result.postings
+        ],
+        reference=result.transaction_number or facts.stock_number or "",
+        balance=result.balance,
+    )
+
     # Checked before the balance: a refused entry never reached the balance
     # check, so reporting "balance $0.00" would be misleading.
     if result.refusal:
@@ -732,6 +817,31 @@ def _run_stock_pre_invoice(
 
     doc.po_number = result.po_number or po_number
     doc.vendor_name = result.vendor_name or doc.vendor_name
+
+    # A stock order's expense lines are Tekion's own -- one per part, each with
+    # the account that part belongs to -- so the split is not ours to describe.
+    # What IS ours is the net it was invoiced for against the A/P credit, which
+    # is the pair a person checks.
+    _record_postings(
+        doc,
+        session,
+        lines=[
+            {
+                "glAccount": "(per part)",
+                "glName": "Tekion's own postings, one per part on the order",
+                "amount": round(result.net_amount or 0, 2),
+                "source": "returned by Tekion",
+            },
+            {
+                "glAccount": "3002",
+                "glName": "A/P",
+                "amount": -round(total or 0, 2),
+                "source": "accounts payable",
+            },
+        ],
+        reference=result.po_number or po_number,
+    )
+
     job_queue.complete(session, doc)
     print(f"[PIPE] {doc.id} -> PROCESSED (pre-invoiced PO {doc.po_number})")
 
@@ -1051,6 +1161,25 @@ def _finish_purchase_order(doc: Document, response: Any, session: Session) -> No
     Shared by the create path and the reuse path so the two cannot drift: a
     reused PO is PROCESSED on exactly the same terms as one we raised.
     """
+    # What the pre-invoice put where. Recorded before the success check so a
+    # partial run still shows the lines it built.
+    if getattr(response, "gl_lines", None):
+        _record_postings(
+            doc,
+            session,
+            lines=[
+                {
+                    "glAccount": line.gl_account,
+                    "glName": line.gl_name,
+                    "amount": line.amount,
+                    "control": doc.ro_number or "",
+                    "source": line.source,
+                }
+                for line in response.gl_lines
+            ],
+            reference=response.po_number or doc.po_number or "",
+        )
+
     if not response.success:
         _fail(session, doc, EX_TEKION_ERROR, error=response.error or "PO creation failed")
         return

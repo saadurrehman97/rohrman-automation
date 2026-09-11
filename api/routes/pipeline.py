@@ -384,6 +384,7 @@ def _to_status(
         po_candidate=_as_json_object(doc.po_candidate) or None,
         manual_fields=_as_json_object(doc.manual_fields),
         vehicle_details=_as_json_object(doc.vehicle_details),
+        posting_details=_as_json_object(doc.posting_details),
         needs_fields=[
             str(f) for f in (_as_json_object(doc.vehicle_details).get("needs") or [])
         ],

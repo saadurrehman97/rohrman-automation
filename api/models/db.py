@@ -244,6 +244,15 @@ class Document(SQLModel, table=True):
     # attempt including refusals -- those are the ones somebody needs to look
     # at, and nothing else here records why an entry came out as it did.
     vehicle_details: str = Field(default="", max_length=8000)
+    # What this document posted to Tekion, in one shape for every flow: the GL
+    # accounts, the amount against each, and what they total. Written on every
+    # attempt including failures -- a refusal is exactly when somebody wants to
+    # see which lines were built and where they stopped adding up.
+    #
+    # Separate from vehicle_details because that one also carries stock numbers,
+    # templates and handwritten annotations, none of which mean anything to a
+    # Misc invoice.
+    posting_details: str = Field(default="", max_length=8000)
     split_from: UUID | None = Field(default=None, foreign_key="documents.id")
     # Which pages of the parent this document is, e.g. "1-2" or "3". Empty for
     # anything that was not split out of a batch.

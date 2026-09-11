@@ -22,6 +22,7 @@ from api.models.schemas import (
     CreateMiscPoRequest,
     CreatePoRequest,
     CreatePoResponse,
+    GlLine,
     CreateStockPoRequest,
     CreateSubletPoRequest,
     VendorCandidate,
@@ -183,6 +184,57 @@ def create_po(
     return response
 
 
+def _gl_lines_posted(
+    *,
+    dealer_id: str,
+    ap_gl_account_id: str,
+    invoice_amount: float,
+    gl_splits: list[dict] | None,
+    gl_account_id: str,
+    net_amount: float,
+    source: str,
+) -> list[GlLine]:
+    """The accounting lines a pre-invoice carried, as Tekion shows them.
+
+    Debits first, then the A/P credit -- the order and the signs of the
+    "Accounting Details" panel in Tekion, so what the document records and what
+    a clerk sees on screen are the same thing read twice.
+
+    Nothing is recomputed here. These are the figures that were sent; if they
+    are wrong they are wrong in Tekion too, which is the point of recording
+    them.
+    """
+    lines: list[GlLine] = []
+    if gl_splits:
+        for split in gl_splits:
+            lines.append(
+                GlLine(
+                    gl_account=str(split.get("gl_account_id") or "").split("_")[-1],
+                    gl_name=str((split.get("resolved") or {}).get("account_name") or ""),
+                    amount=round(float(split.get("amount") or 0), 2),
+                    source=source,
+                )
+            )
+    elif gl_account_id:
+        lines.append(
+            GlLine(
+                gl_account=gl_account_id.split("_")[-1],
+                amount=round(net_amount, 2),
+                source=source,
+            )
+        )
+
+    lines.append(
+        GlLine(
+            gl_account=ap_gl_account_id.split("_")[-1],
+            gl_name="A/P",
+            amount=-round(invoice_amount, 2),
+            source="accounts payable",
+        )
+    )
+    return lines
+
+
 def _create_sublet_po(
     req: CreateSubletPoRequest,
     session: Session,
@@ -309,6 +361,15 @@ def _create_sublet_po(
             po_status=po["status"],
             invoice_id=result["invoiceId"],
             vendor_name=vendor["name"],
+            gl_lines=_gl_lines_posted(
+                dealer_id=dealer_id,
+                ap_gl_account_id=ap_gl_account_id,
+                invoice_amount=req.invoice_amount,
+                gl_splits=None,
+                gl_account_id=gl_account_id,
+                net_amount=req.invoice_amount - req.sales_tax,
+                source="sublet repairs payable",
+            ),
         )
 
     except HTTPException:
@@ -459,6 +520,21 @@ def _create_misc_po(
             po_status=po["status"],
             invoice_id=result["invoiceId"],
             vendor_name=vendor["name"],
+            gl_lines=_gl_lines_posted(
+                dealer_id=dealer_id,
+                ap_gl_account_id=ap_gl_account_id,
+                invoice_amount=req.invoice_amount,
+                gl_splits=gl_splits,
+                gl_account_id=gl_account_id or "",
+                net_amount=req.invoice_amount - req.sales_tax,
+                source=(
+                    "written on the invoice"
+                    if req.gl_splits
+                    else "read from the line items"
+                    if gl_splits
+                    else "resolved from the descriptions"
+                ),
+            ),
         )
 
     except HTTPException:

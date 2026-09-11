@@ -172,6 +172,23 @@ class VendorCandidate(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class GlLine(BaseModel):
+    """One accounting line as it was sent to Tekion.
+
+    The same shape for every flow, so one component can render a Misc
+    invoice's split, an OEM journal entry and a vehicle purchase alike.
+    """
+
+    gl_account: str = ""
+    gl_name: str = ""
+    # Signed: negative is a credit, which is how every flow already carries it.
+    amount: float = 0.0
+    control: str = ""
+    # Where the figure came from, in words -- "written on the invoice",
+    # "template preset". Only the flows that have something to say fill it in.
+    source: str = ""
+
+
 class CreatePoResponse(BaseModel):
     success: bool
     po_number: str | None = None
@@ -184,6 +201,10 @@ class CreatePoResponse(BaseModel):
     needs_review: bool = False
     review_reason: str | None = None
     vendor_candidates: list[VendorCandidate] = Field(default_factory=list)
+    # The accounting lines this PO's pre-invoice carried. Reported so the
+    # document can record what it posted; nothing in the PO response said where
+    # the money went, so a Misc invoice's split was only visible in Tekion.
+    gl_lines: list[GlLine] = Field(default_factory=list)
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -455,6 +476,12 @@ class PipelineStatusResponse(BaseModel):
     manual_fields: dict[str, Any] = Field(default_factory=dict, alias="manualFields")
     # What the vehicle flow read, matched and built. Present on refusals too.
     vehicle_details: dict[str, Any] = Field(default_factory=dict, alias="vehicleDetails")
+    # What this document posted to Tekion -- the GL accounts, the amount against
+    # each, and the totals. The same shape for every flow, so one component
+    # renders a Misc split, a journal entry and a vehicle purchase alike.
+    posting_details: dict[str, Any] = Field(
+        default_factory=dict, alias="postingDetails"
+    )
     # Exactly which fields would fix this document, named by the code that
     # refused it. The correction form renders these and nothing else.
     needs_fields: list[str] = Field(default_factory=list, alias="needsFields")
