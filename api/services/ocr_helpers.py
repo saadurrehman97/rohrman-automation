@@ -119,10 +119,74 @@ def get_control_number(ocr: dict[str, Any]) -> str:
     )
 
 
+# How many whitespace-separated pieces an invoice number may be made of, and how
+# long a piece has to be before it stops looking like part of one.
+_INVOICE_MAX_PARTS = 3
+_INVOICE_CODE_MAX = 3
+_INVOICE_PREFIX_MAX = 4
+
+
 def _clean_invoice_number(raw: str) -> str:
-    trimmed = raw.strip()
-    first_token = trimmed.split()[0] if trimmed.split() else trimmed
-    return first_token or trimmed
+    """The invoice number as printed, including any short code attached to it.
+
+    Letters were never the problem -- "80090801610A" and "41854-39" always came
+    through whole. What was lost was anything after a SPACE, because this took
+    the first token and stopped. S&S Automotive prints
+
+        ORDER          INVOICE        PAGE
+        10180847 SS    6101029 RI     1
+
+    and "RI" is part of the number, not a note beside it. Dropping it makes two
+    different documents from the same vendor collide on 6101029 and reports the
+    second as a duplicate of the first.
+
+    So a short code is kept, on either side of the digits:
+
+        "6101029 RI"    -> "6101029 RI"
+        "RI 6101029"    -> "RI 6101029"
+        "80090801610A"  -> unchanged
+        "41854-39"      -> unchanged
+
+    Bounded on purpose. An identifier field sometimes carries a few words of
+    prose after the number, and a rule that simply kept everything would post
+    "6101029 RI Customer Copy" to Tekion. Only pieces SHORT enough to be a code
+    are taken, and at most three of them:
+
+        "6101029 RI Customer Copy" -> "6101029 RI"
+    """
+    trimmed = " ".join(str(raw or "").split())
+    if not trimmed:
+        return ""
+
+    parts = trimmed.split(" ")
+    kept = [parts[0]]
+    index = 1
+
+    # A leading letter-only code belongs to the digits that follow it: "RI
+    # 6101029" is one number written the other way round, and keeping only "RI"
+    # would throw away the number itself.
+    if (
+        parts[0].isalpha()
+        and len(parts[0]) <= _INVOICE_PREFIX_MAX
+        and len(parts) > 1
+        and any(c.isdigit() for c in parts[1])
+    ):
+        kept.append(parts[1])
+        index = 2
+
+    # Short codes after it: "RI", "SS", "CM". Three characters is the cutoff --
+    # it admits every code seen and excludes the shortest real word likely to
+    # follow one.
+    while (
+        index < len(parts)
+        and len(kept) < _INVOICE_MAX_PARTS
+        and len(parts[index]) <= _INVOICE_CODE_MAX
+        and parts[index].isalnum()
+    ):
+        kept.append(parts[index])
+        index += 1
+
+    return " ".join(kept)
 
 
 def get_invoice_number(ocr: dict[str, Any]) -> str:
