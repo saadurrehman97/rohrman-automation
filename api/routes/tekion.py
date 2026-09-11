@@ -308,6 +308,20 @@ def _create_sublet_po(
                     detail="Sublet PO requires at least one line item with an RO number",
                 )
 
+            # The tax belongs on the order too, or the PO is worth the work
+            # while the invoice against it is worth the work plus tax. It hangs
+            # off the same RO job as the first line -- a sublet line must name a
+            # job, and the tax is for that job's work.
+            if req.sales_tax and round(req.sales_tax, 2) > 0 and items:
+                items.append(
+                    {
+                        **items[0],
+                        "description": "SALES TAX",
+                        "laborAmount": 0.0,
+                        "partsAmount": round(req.sales_tax, 2),
+                    }
+                )
+
             po = client.create_sublet_po(
                 vendor_id=int(vendor["id"]),
                 vendor_name=vendor["name"],
@@ -351,6 +365,14 @@ def _create_sublet_po(
             ref_text=ref_text,
             po_type="SUBLET",
             sales_tax=req.sales_tax,
+            # An order WE raised carries a SALES TAX line, so this invoice
+            # uses all of it -- consuming the net would leave the tax
+            # outstanding on a PO that could then never be closed.
+            #
+            # A REUSED order has no such line: somebody else raised it, for
+            # whatever it is worth, and claiming the tax from it as well would
+            # consume more of their PO than this invoice is entitled to.
+            po_covers_tax=existing_po is None,
             attachment_media_ids=attachment_media_ids or None,
         )
 
@@ -420,6 +442,7 @@ def _create_misc_po(
                 vendor_phone=vendor["phone"],
                 vendor_email=vendor["email"],
                 items=items,
+                sales_tax=req.sales_tax,
             )
 
         # Pre-invoice — use OCR-extracted GL accounts if present, else LLM fallback.
@@ -509,6 +532,14 @@ def _create_misc_po(
             ref_text="",
             po_type="MISCELLANEOUS",
             sales_tax=req.sales_tax,
+            # An order WE raised carries a SALES TAX line, so this invoice
+            # uses all of it -- consuming the net would leave the tax
+            # outstanding on a PO that could then never be closed.
+            #
+            # A REUSED order has no such line: somebody else raised it, for
+            # whatever it is worth, and claiming the tax from it as well would
+            # consume more of their PO than this invoice is entitled to.
+            po_covers_tax=existing_po is None,
             attachment_media_ids=attachment_media_ids or None,
             gl_splits=gl_splits,
         )
