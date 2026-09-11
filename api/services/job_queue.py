@@ -23,6 +23,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
+from typing import Any
+
 from sqlmodel import Session, select
 
 from api.models.db import Document
@@ -33,6 +35,9 @@ STATUS_PROCESSED = "PROCESSED"
 STATUS_EXCEPTION = "EXCEPTION"
 # Held for a human decision, not a failure — nothing was sent to Tekion.
 STATUS_DUPLICATE = "DUPLICATE"
+# The invoice names a purchase order that already exists in Tekion. Like
+# DUPLICATE this is a question, not a failure -- nothing was posted.
+STATUS_PO_DECISION = "PO_DECISION"
 # A batch scan that was broken into one child document per invoice. Terminal:
 # the parent itself is never processed, its children carry the actual work.
 STATUS_SPLIT = "SPLIT"
@@ -159,6 +164,54 @@ def hold_as_duplicate(session: Session, doc: Document, original: Document) -> No
     print(f"[QUEUE] {doc.id} -> DUPLICATE of {original.id}")
 
 
+def hold_for_po_decision(session: Session, doc: Document, found: Any, summary: str) -> None:
+    """Park a run whose invoice names a purchase order that already exists.
+
+    Deliberately not an exception, for the same reason a duplicate is not:
+    nothing went wrong and nothing was posted. Someone says whether to invoice
+    the PO that is already there or raise a new one, and until they do the row
+    waits.
+    """
+    doc.status = STATUS_PO_DECISION
+    doc.po_number = found.po_number or doc.po_number
+    doc.po_candidate = found.as_json(doc.vendor_name)
+    doc.po_choice = ""
+    doc.exception_type = None
+    doc.severity = None
+    doc.locked_at = None
+    doc.locked_by = ""
+    doc.next_attempt_at = None
+    doc.processed_at = _utcnow()
+    doc.last_error = summary[:1000]
+    session.add(doc)
+    session.commit()
+    print(f"[QUEUE] {doc.id} -> PO_DECISION ({found.po_number})")
+
+
+def resolve_po_decision(session: Session, doc: Document, choice: str) -> Document:
+    """Re-queue a held document with the person's choice recorded.
+
+    The choice is consumed by the next run and cleared there, so it applies to
+    this attempt only -- a later upload of the same invoice asks again rather
+    than silently repeating a decision made about a different day's paperwork.
+    """
+    doc.po_choice = choice
+    doc.status = STATUS_QUEUED
+    doc.attempts = 0
+    doc.exception_type = None
+    doc.severity = None
+    doc.last_error = ""
+    doc.locked_at = None
+    doc.locked_by = ""
+    doc.next_attempt_at = None
+    doc.processed_at = None
+    session.add(doc)
+    session.commit()
+    session.refresh(doc)
+    print(f"[QUEUE] {doc.id} PO decision: {choice} -- re-queued")
+    return doc
+
+
 def confirm_duplicate(session: Session, doc: Document) -> Document:
     """Reprocess a duplicate against the ORIGINAL document, not a second one.
 
@@ -193,6 +246,8 @@ def confirm_duplicate(session: Session, doc: Document) -> Document:
     original.invoice_number = doc.invoice_number or original.invoice_number
     original.ro_number = doc.ro_number or original.ro_number
     original.ocr_document_type = doc.ocr_document_type or original.ocr_document_type
+    # The person who re-uploaded and confirmed now owns this row's result.
+    original.uploaded_by_id = doc.uploaded_by_id or original.uploaded_by_id
 
     # Previous Tekion references belong to the earlier run and would be
     # misleading if this one fails. The UI shows them before confirming.
@@ -221,6 +276,33 @@ def confirm_duplicate(session: Session, doc: Document) -> Document:
     session.refresh(original)
     print(f"[QUEUE] duplicate confirmed -- re-running {original.id}")
     return original
+
+
+def requeue_for_rerun(session: Session, doc: Document) -> Document:
+    """Put a failed document back on the queue after a person corrected it.
+
+    The attempt counter is reset. Retries exist to ride out a flaky Tekion, and
+    this is not a retry -- the inputs changed, so the previous failures say
+    nothing about whether this run will work, and letting them count would
+    exhaust the budget on a document that is now correct.
+
+    The previous error is cleared for the same reason: leaving it visible next
+    to a QUEUED row reads as a fresh failure.
+    """
+    doc.status = STATUS_QUEUED
+    doc.exception_type = None
+    doc.severity = None
+    doc.last_error = ""
+    doc.attempts = 0
+    doc.next_attempt_at = None
+    doc.locked_at = None
+    doc.locked_by = ""
+    doc.processed_at = None
+    session.add(doc)
+    session.commit()
+    session.refresh(doc)
+    print(f"[QUEUE] {doc.id} -> QUEUED (re-run with corrections)")
+    return doc
 
 
 def requeue_stale(session: Session) -> int:

@@ -8,14 +8,37 @@ from sqlalchemy import UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
+# Timestamps are stored NAIVE, and naive means UTC.
+#
+# That was already the assumption everywhere that reads one back
+# (`exp.replace(tzinfo=timezone.utc)`), but it was not true on write: handing an
+# aware datetime to a TIMESTAMP WITHOUT TIME ZONE column makes psycopg convert
+# it to the session's timezone first and store the local wall clock. On a
+# machine at UTC+5 an invite written to expire in 24 hours came back reading
+# five hours later than intended, and a password reset link that had expired
+# still validated as good.
+#
+# Stripping the offset here makes what is stored match what every reader
+# already believes. It also makes the behaviour identical wherever the app runs,
+# rather than silently depending on the server's timezone.
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _utcnow_plus_hours(hours: int) -> datetime:
     from datetime import timedelta
 
-    return datetime.now(timezone.utc) + timedelta(hours=hours)
+    return _utcnow() + timedelta(hours=hours)
+
+
+def as_utc(value: datetime) -> datetime:
+    """A stored timestamp as an aware UTC datetime."""
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
+def is_expired(expires_at: datetime) -> bool:
+    """Whether a stored expiry has passed. The one place that decides."""
+    return as_utc(expires_at) < datetime.now(timezone.utc)
 
 
 class User(SQLModel, table=True):
@@ -114,9 +137,13 @@ class Document(SQLModel, table=True):
     vin: str = Field(default="", max_length=20)
     ro_number: str = Field(default="", max_length=100)
     po_number: str = Field(default="", max_length=100)
-    # SUBLET, MISCELLANEOUS, STOCK, OEM. Set from the upload folder, which is
-    # authoritative: it selects the pipeline even when OCR disagrees.
-    po_type: str = Field(default="", max_length=20, index=True)
+    # SUBLET, MISCELLANEOUS, STOCK, OEM, VEHICLE_MANUFACTURING. Set from the
+    # upload folder, which is authoritative: it selects the pipeline even when
+    # OCR disagrees.
+    #
+    # 40, not 20: VEHICLE_MANUFACTURING is 21 characters and broke every upload
+    # into that folder with a 500 at the INSERT. Room for the next folder name.
+    po_type: str = Field(default="", max_length=40, index=True)
     # AP_INVOICE, PO, PARTS_TICKET, JOURNAL, GL_REPORT, STATEMENT, REPAIR_ORDER, MANUFACTURER_INVOICE
     document_type: str = Field(default="", max_length=30, index=True)
     # What OCR actually detected. Kept alongside po_type so a folder/OCR
@@ -127,17 +154,27 @@ class Document(SQLModel, table=True):
     transaction_id: str = Field(default="", max_length=50)
     transaction_number: str = Field(default="", max_length=50)
     journal_id: str = Field(default="", max_length=50)
-    # QUEUED, PROCESSING, PROCESSED, EXCEPTION, DUPLICATE, AUTO_RESOLVED
+    # QUEUED, PROCESSING, PROCESSED, EXCEPTION, DUPLICATE, PO_DECISION,
+    # AUTO_RESOLVED
     # (PENDING is retained for rows created before the queue existed.)
     #
     # DUPLICATE is a decision point, not a failure: OCR matched an invoice that
     # was already processed, so the run is held until someone confirms or
     # discards it. Nothing was sent to Tekion.
+    #
+    # PO_DECISION is the same idea for a different question: the invoice names a
+    # purchase order that already exists in Tekion, and whether to use it or
+    # raise a new one is a person's call. Nothing was sent to Tekion.
     status: str = Field(default="QUEUED", max_length=20, index=True)
     # VENDOR_NOT_FOUND, PO_MISMATCH, AMOUNT_MISMATCH, LOW_OCR_CONFIDENCE, etc.
     exception_type: str | None = Field(default=None, max_length=100)
     # HIGH, MEDIUM, LOW
     severity: str | None = Field(default=None, max_length=10, index=True)
+    # Who uploaded it. Null for rows created before this was tracked, and if the
+    # uploader's account is later deleted (the FK is ON DELETE SET NULL).
+    uploaded_by_id: UUID | None = Field(
+        default=None, foreign_key="users.id", index=True
+    )
     created_at: datetime = Field(default_factory=_utcnow, index=True)
     processed_at: datetime | None = Field(default=None)
 
@@ -168,10 +205,28 @@ class Document(SQLModel, table=True):
     # so a later upload is still checked normally.
     duplicate_override: bool = Field(default=False)
 
+    # ── Reusing an existing purchase order (SUBLET / MISCELLANEOUS) ───────────
+    # What the PO lookup found, as JSON: number, vendor, total, status and the
+    # invoices already on it. Stored so the queue can show the choice without
+    # going back to Tekion, and so resuming does not look it up twice.
+    po_candidate: str = Field(default="", max_length=2000)
+    # EXISTING or NEW -- what a person chose. Honoured for exactly one run and
+    # then cleared, like duplicate_override, so a later upload is asked again.
+    po_choice: str = Field(default="", max_length=20)
+
     # ── Batch scans ───────────────────────────────────────────────────────────
     # Several invoices scanned into one file are split into one document each.
     # The parent keeps the original file and the SPLIT status; each child points
     # back here and owns the pages it was cut from. A child is never re-split.
+    # What a person typed in after a refusal, as JSON. Overlaid on the OCR
+    # result when the document runs again. Separate from the OCR-derived fields
+    # on purpose: "the invoice says this" and "a person asserted this" are
+    # different claims and the difference is worth keeping.
+    manual_fields: str = Field(default="", max_length=4000)
+    # What the vehicle flow read, matched and built, as JSON. Written on every
+    # attempt including refusals -- those are the ones somebody needs to look
+    # at, and nothing else here records why an entry came out as it did.
+    vehicle_details: str = Field(default="", max_length=8000)
     split_from: UUID | None = Field(default=None, foreign_key="documents.id")
     # Which pages of the parent this document is, e.g. "1-2" or "3". Empty for
     # anything that was not split out of a batch.
@@ -241,6 +296,28 @@ class Notification(SQLModel, table=True):
     # Optional link to a document
     document_id: UUID | None = Field(default=None, foreign_key="documents.id")
     created_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class PasswordReset(SQLModel, table=True):
+    """A single-use link for resetting a forgotten password.
+
+    Its own table rather than columns on User: a reset token is a credential
+    with its own lifetime, and storing it beside the password hash makes it
+    easy to leak one while reading the other.
+
+    Rows are kept after use rather than deleted, so a second click on the same
+    link can be told it was already used instead of "invalid", which is what
+    sends people to support.
+    """
+
+    __tablename__ = "password_resets"
+
+    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    token: str = Field(index=True, unique=True, max_length=64)
+    user_id: UUID = Field(foreign_key="users.id", index=True)
+    expires_at: datetime
+    used: bool = Field(default=False)
+    created_at: datetime = Field(default_factory=_utcnow)
 
 
 class InviteCode(SQLModel, table=True):

@@ -96,24 +96,129 @@ GL ACCOUNTS & SPATIAL BINDING:
 - BIND GL CODES TO CHARGES (LAYOUT-AGNOSTIC SPATIAL RULES):
   Use the visual layout and handwritten annotations to map each detected GL code to its
   corresponding line item, charge, or fee:
-  1. Horizontal Row Alignment: If a GL code shares the same horizontal row/band as a line item,
-     assign it directly to that line item's description and amount.
+  1. Horizontal Row Alignment (HIGHEST PRIORITY, CHECK THIS FIRST): If a GL code sits on the same
+     horizontal band as a line item -- including in the LEFT OR RIGHT MARGIN, outside the table
+     border, level with that row -- it belongs to THAT line item and no other. Being in the margin
+     does not make it a document-wide default; only being level with no row does. A code written
+     level with the first of ten rows applies to that row alone.
+     Different rows routinely carry different codes: read each one independently and give every
+     row its own `gl_account`.
   2. Vector / Arrow Anchoring: If a line or arrow points from a GL code to a specific cell, part
      description, or amount, bind the GL code to that target item regardless of where it appears.
+     THE TARGET MAY BE INSIDE A SENTENCE, not only in a table. Vehicle invoices state figures in
+     prose -- "DEALER RECEIVES A RESERVE OF $1,129.00, WHICH INCLUDES A PPO RESERVE OF $392.00,
+     AND WHOLESALE FINANCE RESERVE OF $368.00".
+
+     FOLLOW THE ARROW BY POSITION. An arrow drawn above a line of text points at whatever is
+     DIRECTLY BELOW ITS TIP -- compare horizontal positions and take the figure the tip lands on
+     or nearest to it. Do not pick a figure because its wording sounds related to the account, and
+     do not pick the first or last figure in the sentence by default. Where two arrows sit above
+     the same sentence they land at different horizontal positions and therefore on different
+     figures; the LEFTMOST arrow takes the leftmost figure it reaches, the next arrow the next.
+
+     On the invoice above, an arrow whose tip sits over "$1,129.00" means $1,129.00 -- not the
+     $392.00 or $368.00 later in the same sentence.
+  2a. TRANSCRIBE BEFORE YOU DECIDE. For every handwritten GL code with an arrow, first read out
+     the text the arrow TIP physically touches -- roughly 40 characters of the line directly
+     beneath it, copied verbatim -- and put that in `mapped_description`. Then take `amount` from
+     the money figure inside THAT span, and nowhere else.
+
+     This is a transcription task, not a judgement: copy what is under the tip and read its
+     number. Do not summarise the clause, do not name the kind of figure it is, and do not choose
+     between figures elsewhere in the sentence because their wording suits the account.
+
+     A sentence may hold several figures -- "A RESERVE OF $1,129.00, WHICH INCLUDES A PPO RESERVE
+     OF $392.00, AND WHOLESALE FINANCE RESERVE OF $368.00" holds three. Two handwritten codes do
+     NOT mean the last two figures, or the first two. Each code takes the figure its own arrow
+     lands on, and two codes may well land on figures that are not adjacent.
+
+  2b. NEVER invent the pairing. If a GL code is written but you cannot determine which figure its
+     arrow lands on, report the code in `gl_mappings[]` with `"amount": null` and say in
+     `mapped_description` what was unclear. Guessing from wording is what produces a confident
+     wrong answer: an account named for one thing is routinely pointed at a figure described as
+     another, and only the arrow says which. A wrong amount is far worse than a missing one: it
+     posts real money to a real account and balances, so nothing downstream can detect it.
   3. Enclosure & Contour Grouping: If a dollar amount, line item, fee, discount, or tax line is
      circled, boxed, or underlined, and a GL code is written inside or adjacent to that boundary,
      bind the GL code exclusively to that enclosed item and amount.
-  4. Unanchored / Global Fallback: If a GL code is written in a header, margin, or blank area
-     without arrows or enclosures targeting a specific row, treat it as the default GL code for
-     all unmapped items/charges on the document.
+  4. Unanchored / Global Fallback (LAST RESORT): Only when a GL code lines up with no row at all
+     -- in a page header, footer, or a blank area well away from the table -- treat it as the
+     default for items that got no code from rules 1-3. Never apply this to a code that is level
+     with a row; that is rule 1.
   5. Multi-GL Split Handling: If an invoice contains multiple GL codes, resolve each code's
      spatial target independently to ensure every line item, subtotal, discount, or extra fee is
      assigned its correct GL code and corresponding dollar amount.
 - POPULATE OUTPUT:
-  - For items in `line_items[]`, populate the string field `gl_account` (e.g. `gl_account: "2410"`).
+  - For items in `line_items[]`, populate the string field `gl_account` (e.g. `gl_account: "2410"`)
+    on EVERY row that has one. This is per-row: three rows with three different handwritten codes
+    must come back as three different `gl_account` values, not one repeated or one at document
+    level. Leave it empty only for a row with no code of its own.
   - For fees, discounts, freight, or subtotals outside the main table that have an assigned GL
     code, populate `gl_mappings[]` with: `gl_account`, `amount`, and `mapped_description`
     (e.g. `{"gl_account": "7555", "amount": "15.12", "mapped_description": "Delivery Charge"}`).
+  - GL CODES WRITTEN WITH THEIR OWN AMOUNTS: wherever an account appears with a dollar figure
+    beside it, that is the clerk stating how the invoice divides. It may be circled, boxed, in a
+    margin, at the foot of the page, or just written plainly with nothing around it -- the layout
+    does not matter and there is no need for it to look like a block. What identifies it is an
+    account number followed by an amount. The commonest form is a short list written in open
+    space on the page:
+
+        GL 2245    1129$
+        GL 2250     368$
+
+    There is no limit to how many lines such a list has, and the prefix varies -- "GL", "GL#",
+    "gl", or nothing at all before the number. Capture EVERY such pair in `gl_mappings[]`, one
+    entry each, with the amount exactly as written:
+
+        GL# 7193   $2,378.11        -> {"gl_account": "7193", "amount": "2378.11", ...}
+        GL# 3142   $202.12          -> {"gl_account": "3142", "amount": "202.12", ...}
+
+    Accounts written this way do NOT belong to any single row and must not be copied into
+    `line_items[].gl_account`. This is now the usual way GL accounts are marked: expect the
+    accounts to be written once for the invoice with their amounts, NOT beside individual rows.
+    They typically split the invoice total -- commonly goods against sales tax -- so the amounts
+    are expected to sum to it. Read the account from the "GL#"/"GL" label and the amount from the
+    figure beside it; a superscript or raised cent figure ($202^12) is 202.12.
+  - A code in that block that appears WITHOUT an amount is the older per-row style: leave it out of
+    the block and bind it to its row under the spatial rules above.
+  - ALWAYS populate `gl_mappings[]` for a handwritten GL code that an arrow, line or bracket ties
+    to ANY value on the page -- not only for fees and charges. On a vehicle manufacturer invoice
+    this is the entire point of the annotation, and every handwritten code must appear there.
+  - AMOUNTS EMBEDDED IN REFERENCE CODES: the value an arrow points at is often INSIDE a printed
+    code rather than shown as a dollar figure. In `1001948819-KAC0780KAC-KRS0290-FPA0156`,
+    `KAC0780KAC` carries 780.00 and `KRS0290` carries 290.00: read the digit run beside the
+    letters and drop leading zeros. When a handwritten GL code points at such a segment, emit
+    `{"gl_account": "2245", "amount": "780.00", "mapped_description": "KAC0780KAC"}` -- put the
+    code segment verbatim in `mapped_description` so the reading can be checked.
+  - A PURCHASE ORDER NUMBER WRITTEN ON BY HAND: staff often write the PO number the invoice
+    should be billed against in a margin or at the top of the page -- "PO 35096", "P.O. #35096",
+    or just "35096" beside the word PO. Put it in `identifiers[]` as
+    `{"label": "Purchase Order", "value": "35096"}`, exactly as a printed one would be, AND leave
+    it in `handwritten_notes[]` as well. It is the same fact whether it was typed or written.
+
+    Do NOT report the vendor's postal "PO BOX" as a purchase order number, and do not invent one
+    from an invoice number, account number or RO number that happens to sit near the word PO.
+  - FIGURES PRINTED IN CENTS WITH NO DECIMAL POINT: a vehicle manufacturer invoice often prints a
+    short run of bare digit groups on or beside the MSRP line, with no dollar sign, no comma and
+    no decimal point:
+
+        MSRP $42,795.00      42800   4400   85590
+
+    These are amounts in cents -- 428.00, 44.00 and 855.90 -- and they are the manufacturer's own
+    statement of the allowances and holdback on the car. Copy each one into `coded_amounts[]`
+    EXACTLY as printed, as a digit string, in left-to-right order: `["42800", "4400", "85590"]`.
+    Do not insert the decimal point, do not reorder them and do not drop one because it looks
+    like a duplicate of something written by hand.
+
+    Only bare digit runs belong here. Leave out anything carrying a dollar sign, comma or decimal
+    point (the MSRP itself), and leave out the VIN, engine number, stock number, control number,
+    key code, dealer number, order reference, zip code and phone number. If the invoice has no
+    such run, return an empty array.
+  - When a handwritten GL code points instead at a labelled figure in a totals column, use that
+    figure and name the label (e.g. `{"gl_account": "3300", "amount": "32133.00",
+    "mapped_description": "TOTAL dealer cost"}`).
+  - Report `amount` as a POSITIVE number in `gl_mappings[]`. Debit/credit direction is decided
+    downstream, never here.
 
 Return ONLY the JSON object described by the schema. No commentary, no markdown fences.
 """
@@ -169,6 +274,7 @@ def build_response_schema() -> types.Schema:
             "amount": _str(),
             "mapped_description": _str(),
         })),
+        "coded_amounts": _arr(_S(type=_T.STRING)),
         "handwritten_notes": _arr(_S(type=_T.STRING)),
         "illegible": _arr(_S(type=_T.STRING)),
     }, required=["document_type"])

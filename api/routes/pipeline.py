@@ -6,7 +6,8 @@ GET  /api/pipeline/queue          — queue depth by status
 GET  /api/pipeline/folders        — the folders the frontend can upload into
 
 The folder decides which Tekion flow runs (see api/services/pipeline_service.py):
-SUBLET / MISCELLANEOUS / STOCK create a purchase order, OEM creates a journal
+SUBLET / MISCELLANEOUS / STOCK create a purchase order; OEM and
+VEHICLE_MANUFACTURING create a journal
 entry saved as a draft.
 
 Upload only enqueues: it writes the file, creates the `documents` row as QUEUED,
@@ -17,6 +18,7 @@ than opening ten Tekion sessions at once.
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 from pathlib import Path
 from typing import Annotated
@@ -26,13 +28,16 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlmodel import Session, select
 
 from api.db import get_session
-from api.models.db import Document
+from api.deps import CurrentUserDep
+from api.models.db import Document, User
 from api.models.schemas import (
     MessageResponse,
     PipelineAcceptedResponse,
     PipelineStatusResponse,
+    PoDecisionRequest,
+    RerunRequest,
 )
-from api.services import job_queue, s3_service
+from api.services import job_queue, po_reuse, pipeline_service, s3_service
 from api.services.pipeline_service import VALID_FOLDERS, normalize_folder
 
 router = APIRouter(prefix="/api/pipeline", tags=["pipeline"])
@@ -60,8 +65,9 @@ def queue_stats(session: Annotated[Session, Depends(get_session)]) -> dict[str, 
 @router.post("/process", response_model=PipelineAcceptedResponse, status_code=202)
 async def process_upload(
     session: Annotated[Session, Depends(get_session)],
+    current_user: CurrentUserDep,
     file: UploadFile = File(...),
-    folder: str = Form(..., description="SUBLET | MISCELLANEOUS | STOCK | OEM"),
+    folder: str = Form(..., description="SUBLET | MISCELLANEOUS | STOCK | OEM | VEHICLE_MANUFACTURING"),
     dealership_name: str = Form("", description="Dealership the invoice belongs to"),
 ) -> PipelineAcceptedResponse:
     """Upload an invoice into a folder and queue it for processing."""
@@ -111,6 +117,7 @@ async def process_upload(
         dealership_name=dealership_name,
         po_type=po_type,
         status=job_queue.STATUS_QUEUED,
+        uploaded_by_id=current_user.id,
     )
     session.add(doc)
     session.commit()
@@ -151,7 +158,7 @@ def confirm_duplicate(
         )
 
     original = job_queue.confirm_duplicate(session, doc)
-    return _to_status(original)
+    return _to_status(original, session=session)
 
 
 @router.post("/jobs/{document_id}/discard", response_model=MessageResponse)
@@ -179,6 +186,90 @@ def discard_duplicate(
     return MessageResponse(message="Duplicate discarded")
 
 
+@router.post("/jobs/{document_id}/po-decision", response_model=PipelineStatusResponse)
+def decide_purchase_order(
+    document_id: UUID,
+    payload: PoDecisionRequest,
+    session: Annotated[Session, Depends(get_session)],
+) -> PipelineStatusResponse:
+    """Say whether to invoice the existing purchase order or raise a new one.
+
+    The document is held in PO_DECISION because it names a PO that already
+    exists in Tekion, and posting against an order somebody else raised is not
+    a call the pipeline makes on its own.
+
+    The choice applies to THIS run only. A later upload of the same invoice is
+    asked again rather than inheriting a decision made about different
+    paperwork.
+    """
+    doc = session.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.status != job_queue.STATUS_PO_DECISION:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Document is {doc.status}, not awaiting a purchase order decision",
+        )
+
+    choice = (
+        po_reuse.CHOICE_EXISTING
+        if payload.choice == "existing"
+        else po_reuse.CHOICE_NEW
+    )
+    return _to_status(job_queue.resolve_po_decision(session, doc, choice), session=session)
+
+
+@router.post("/jobs/{document_id}/rerun", response_model=PipelineStatusResponse)
+def rerun_document(
+    document_id: UUID,
+    payload: RerunRequest,
+    session: Annotated[Session, Depends(get_session)],
+) -> PipelineStatusResponse:
+    """Run a refused document again, with fields a person supplied.
+
+    The invoice is not read again. OCR from the first attempt is cached, the
+    corrections are overlaid on it, and the document goes back on the queue --
+    so a missing stock number is fixed in seconds without another Gemini pass,
+    and without needing the uploaded file, which is usually gone by now.
+
+    Only a document in EXCEPTION can be re-run. A PROCESSED one has already
+    posted to Tekion, and running it again would create a second record there;
+    that path is `confirm-duplicate`, which says what it does.
+    """
+    doc = session.get(Document, document_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if doc.status != job_queue.STATUS_EXCEPTION:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Document is {doc.status}; only a failed document can be re-run",
+        )
+
+    # Merged with anything supplied on an earlier re-run, so a second correction
+    # does not discard the first.
+    fields = pipeline_service.manual_overrides(doc)
+    supplied = payload.model_dump(exclude_defaults=True, by_alias=False)
+    for key, value in supplied.items():
+        if key == "gl_annotations":
+            merged = dict(fields.get("gl_annotations") or {})
+            merged.update({k: v for k, v in (value or {}).items() if str(v).strip()})
+            if merged:
+                fields["gl_annotations"] = merged
+        elif str(value).strip():
+            fields[key] = value
+
+    if not fields:
+        raise HTTPException(
+            status_code=400,
+            detail="No corrections supplied. Fill in at least one field before re-running.",
+        )
+
+    doc.manual_fields = json.dumps(fields)[:4000]
+    job_queue.requeue_for_rerun(session, doc)
+    print(f"[PIPE] {doc.id} re-run requested with {fields}")
+    return _to_status(doc, session=session)
+
+
 @router.get("/jobs/{document_id}", response_model=PipelineStatusResponse)
 def get_job(
     document_id: UUID,
@@ -200,12 +291,35 @@ def get_job(
             ).all()
         )
 
-    return _to_status(doc, children)
+    return _to_status(doc, children, session=session)
+
+
+def _as_json_object(raw: str) -> dict:
+    """A stored JSON column as a dict, or {} for anything unreadable.
+
+    These columns are written by this application and never by a user, so bad
+    JSON means a bug rather than an attack -- but a detail page should still
+    render without it rather than 500 on a row somebody truncated.
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _to_status(
-    doc: Document, children: list[UUID] | None = None
+    doc: Document,
+    children: list[UUID] | None = None,
+    session: Session | None = None,
 ) -> PipelineStatusResponse:
+    uploaded_by = ""
+    if session is not None and doc.uploaded_by_id is not None:
+        uploader = session.get(User, doc.uploaded_by_id)
+        if uploader is not None:
+            uploaded_by = uploader.full_name or uploader.email
     return PipelineStatusResponse(
         document_id=doc.id,
         status=doc.status,
@@ -222,6 +336,12 @@ def _to_status(
         journal_id=doc.journal_id,
         ocr_document_type=doc.ocr_document_type,
         duplicate_of=doc.duplicate_of,
+        po_candidate=_as_json_object(doc.po_candidate) or None,
+        manual_fields=_as_json_object(doc.manual_fields),
+        vehicle_details=_as_json_object(doc.vehicle_details),
+        needs_fields=[
+            str(f) for f in (_as_json_object(doc.vehicle_details).get("needs") or [])
+        ],
         split_from=doc.split_from,
         page_range=doc.page_range,
         children=children or [],
@@ -229,6 +349,7 @@ def _to_status(
         severity=doc.severity,
         attempts=doc.attempts,
         last_error=doc.last_error,
+        uploaded_by=uploaded_by,
         created_at=doc.created_at,
         processed_at=doc.processed_at,
     )

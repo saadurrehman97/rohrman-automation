@@ -160,6 +160,15 @@ def _clean_po_number(raw: Any) -> str:
     return stripped or text
 
 
+# A purchase order number a person wrote on the page: "PO 35096", "P.O. #35096".
+# The label is what separates it from every other number on the invoice, and
+# "PO BOX" is excluded because it appears in most vendor addresses.
+_WRITTEN_PO = re.compile(
+    r"\bP\.?\s*O\.?(?!\s*BOX)\s*(?:NUMBER|NO|#)?\s*[#:.-]?\s*([A-Za-z0-9-]{3,20})\b",
+    re.IGNORECASE,
+)
+
+
 def get_po_number(ocr: dict[str, Any]) -> str:
     """The purchase order number printed on the invoice.
 
@@ -198,7 +207,23 @@ def get_po_number(ocr: dict[str, Any]) -> str:
     if found:
         return found
 
-    return _clean_po_number(ocr.get("po_number") or ocr.get("poNumber") or "")
+    found = _clean_po_number(ocr.get("po_number") or ocr.get("poNumber") or "")
+    if found:
+        return found
+
+    # Written on by hand. The prompt asks for these in identifiers[] too, but a
+    # margin scribble is the case OCR is least consistent about structuring, and
+    # the raw transcription is where it always survives.
+    #
+    # A LABEL IS REQUIRED here -- unlike the printed path, which trusts the
+    # field's own name. A note is just text on a page: scanning it for bare
+    # digits would return the RO number, the account number or the date.
+    for note in ocr.get("handwritten_notes") or []:
+        match = _WRITTEN_PO.search(str(note or ""))
+        if match:
+            return _clean_po_number(match.group(1))
+
+    return ""
 
 
 
@@ -247,6 +272,19 @@ def get_document_gl_account(ocr: dict[str, Any]) -> str:
     if len(per_line) == 1:
         return per_line.pop()
 
+    return _written_on_the_document(ocr)
+
+
+def _written_on_the_document(ocr: dict[str, Any]) -> str:
+    """A GL account written for the DOCUMENT, ignoring the line items.
+
+    Split out from `get_document_gl_account` because its first rule -- an
+    account every line agrees on -- must not be used when filling in blank
+    lines. One line carrying 7550 while another carries nothing is not
+    agreement; treating it as such copies one row's account onto rows the clerk
+    never marked, which is exactly the kind of quiet mistake that puts money in
+    the wrong account.
+    """
     for mapping in ocr.get("gl_mappings") or []:
         account = _first_gl(mapping.get("gl_account"))
         if account:
@@ -295,6 +333,20 @@ def _normalize_date(raw: Any) -> str:
             return datetime.strptime(text, fmt).strftime("%m/%d/%Y")
         except ValueError:
             continue
+    # Ford prints "Date Inv. Prepared" as three separate boxes, which OCR reads
+    # back as "08 05 26". Matched as a WHOLE string rather than searched for, so
+    # that three unrelated numbers sitting near each other in some other field
+    # cannot be mistaken for a date.
+    m = re.fullmatch(r"\s*(\d{1,2})[\s.](\d{1,2})[\s.](\d{2,4})\s*", text)
+    if m:
+        month, day, year = m.groups()
+        if len(year) == 2:
+            year = f"20{year}"
+        try:
+            return datetime(int(year), int(month), int(day)).strftime("%m/%d/%Y")
+        except ValueError:
+            return ""
+
     # Last resort: pull an M/D/Y out of a longer string ("Invoice Date 05/12/2026").
     m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", text)
     if m:
@@ -462,4 +514,140 @@ def get_raw_line_items(ocr: dict[str, Any]) -> list[dict[str, Any]]:
                 "glAccount": item.get("gl_account") or "",
             }
         )
+
+    # A GL written once for the whole document applies to every line on it.
+    #
+    # Clerks write "GL 6173" in the margin beside the charge, or across the top,
+    # and OCR reports that as a document-level account rather than a per-line
+    # one -- there is nothing pointing at an individual row to attach it to.
+    # Without this the account was read successfully and then used by nobody:
+    # the PO flows only look at line_items[].gl_account, so an invoice with a
+    # margin GL fell through to the Gemini classifier as though nothing had been
+    # written on it at all.
+    #
+    # Only fills a blank. A line with its own account keeps it, because a
+    # document-level note is the default for the page, not an override of a
+    # specific row.
+    if any(not row["glAccount"] for row in result):
+        document_gl = _written_on_the_document(ocr)
+        if document_gl:
+            for row in result:
+                if not row["glAccount"]:
+                    row["glAccount"] = document_gl
     return result
+
+
+# A handwritten note that states an account and the figure beside it:
+#     "GL# 2410 $414.00"    -> 2410,  +414.00
+#     "GL# 6777 -$62.10"    -> 6777,   -62.10
+#     "2248 641.93 HTB"     -> 2248,  +641.93, labelled HTB
+#
+# Anchored at the start so a note that merely CONTAINS numbers is not read as
+# an annotation: "HTB 641.93" and "OBT 7992" both fail here, which is right --
+# the first is a memo of a figure and the second is a stock number.
+_NOTE_GL_LINE = re.compile(
+    r"^\s*(?:GL|G/?L|ACCT|ACCOUNT|A/C)?\s*#?\s*"
+    r"(\d{4,5}[A-Za-z]?)\s+"
+    r"(-\s*)?\$?\s*([\d,]+(?:\.\d{1,2})?)\s*\$?"
+    r"\s*(.*)$",
+    re.IGNORECASE,
+)
+
+
+def gl_notes(ocr: dict[str, Any]) -> list[dict[str, Any]]:
+    """Accounts and amounts read straight off the transcribed handwriting.
+
+    THE SIGN LIVES HERE AND NOWHERE ELSE. The vision prompt asks for a POSITIVE
+    figure in `gl_mappings` and leaves debit/credit to be decided downstream, so
+    a clerk who writes "GL# 6777 -$62.10" gets 62.10 back from the structured
+    output. The raw note is the only place that minus survives, and without it
+    a discount posts as a charge -- which is how a Honda parts invoice came out
+    $124.20 over, exactly twice the discount.
+
+    Returns [{"account", "amount" (signed), "label", "signed"}] in the order the
+    notes were read. `signed` records whether a minus was actually on the page,
+    as opposed to the amount simply arriving positive.
+    """
+    found: list[dict[str, Any]] = []
+    for raw in ocr.get("handwritten_notes") or []:
+        match = _NOTE_GL_LINE.match(str(raw or ""))
+        if not match:
+            continue
+        amount = _parse_amount(match.group(3))
+        if amount is None:
+            continue
+        negative = bool(match.group(2))
+        found.append(
+            {
+                "account": match.group(1).upper(),
+                "amount": -abs(amount) if negative else abs(amount),
+                "label": match.group(4).strip(),
+                "signed": negative,
+            }
+        )
+    return found
+
+
+def get_gl_amount_splits(ocr: dict[str, Any]) -> list[dict[str, Any]]:
+    """GL accounts written on the invoice WITH the amount each one takes.
+
+    The newer annotation style. Instead of marking each row, the clerk writes a
+    block naming the accounts and how the invoice divides between them:
+
+        GL# 7193   $2,378.11
+        GL# 3142   $202.12
+
+    That is a complete instruction on its own -- the accounts and the split --
+    so it does not need line items to be attached to, and there is no rule that
+    could derive it from them. The two amounts above are the goods and the sales
+    tax; nothing about the parts table says which account tax belongs in.
+
+    Returns [] when the invoice carries no amounts against its accounts, which
+    is the older style where a code sits beside a row and the split has to be
+    worked out from the rows themselves.
+    """
+    notes = gl_notes(ocr)
+    claimed: set[int] = set()
+
+    splits: list[dict[str, Any]] = []
+    for mapping in ocr.get("gl_mappings") or []:
+        if not isinstance(mapping, dict):
+            continue
+        account = _first_gl(mapping.get("gl_account"))
+        amount = _parse_amount(mapping.get("amount"))
+        # An account with no amount is the older style and belongs to the
+        # per-line path; taking it here would post a zero split.
+        if not account or not amount:
+            continue
+
+        # The transcription of this same figure, for its sign. gl_mappings
+        # reports a positive amount whatever the page says -- see gl_notes --
+        # so a discount written "-$62.10" arrives here as a charge unless the
+        # note is consulted.
+        twin = next(
+            (
+                i
+                for i, note in enumerate(notes)
+                if i not in claimed
+                and note["account"] == account.upper()
+                and round(abs(note["amount"]), 2) == round(abs(amount), 2)
+            ),
+            None,
+        )
+        if twin is not None:
+            claimed.add(twin)
+            amount = notes[twin]["amount"]
+        elif amount < 0:
+            # A minus that came through the structured output anyway means the
+            # model saw one; the prompt asking for positives does not make it
+            # noise.
+            pass
+
+        splits.append(
+            {
+                "gl_account": account,
+                "amount": round(amount, 2),
+                "description": str(mapping.get("mapped_description") or "") or None,
+            }
+        )
+    return splits

@@ -7,6 +7,8 @@ upload folder decides which Tekion flow runs:
     MISCELLANEOUS  -> Misc PO     + pre-invoice   (api/routes/tekion.py)
     STOCK          -> Vendor stock order          (api/routes/tekion.py)
     OEM            -> Journal entry, saved as draft (api/services/je_creation.py)
+    VEHICLE_MANUFACTURING -> Vehicle purchase journal entry from a
+                      per-manufacturer template (api/services/vmi_je_creation.py)
 
 None of those flows are reimplemented here — this module calls the existing
 functions unchanged.
@@ -29,6 +31,8 @@ CONCURRENCY
 """
 from __future__ import annotations
 
+import json
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -38,9 +42,15 @@ from sqlmodel import Session
 
 from api.db import engine
 from api.models.db import Document
-from api.services import document_splitter, job_queue, ocr_helpers, s3_service
+from api.services import (
+    document_splitter,
+    job_queue,
+    ocr_helpers,
+    po_reuse,
+    s3_service,
+)
 from api.services.ocr_service import extract_document
-from api.services.tekion_lock import tekion_scope
+from api.services.tekion_lock import dealer_scope, tekion_scope
 
 # ── Folders the frontend can upload into ─────────────────────────────────────
 
@@ -48,8 +58,13 @@ FOLDER_SUBLET = "SUBLET"
 FOLDER_MISC = "MISCELLANEOUS"
 FOLDER_STOCK = "STOCK"
 FOLDER_OEM = "OEM"
+# Vehicle manufacturer invoices (Kia, Ford, Honda, Toyota). A journal entry
+# like OEM, but built from a per-manufacturer template rather than the invoice
+# total -- one car produces seven lines across inventory, notes payable and
+# receivables. See api/services/vmi_je_creation.py.
+FOLDER_VMI = "VEHICLE_MANUFACTURING"
 
-VALID_FOLDERS = {FOLDER_SUBLET, FOLDER_MISC, FOLDER_STOCK, FOLDER_OEM}
+VALID_FOLDERS = {FOLDER_SUBLET, FOLDER_MISC, FOLDER_STOCK, FOLDER_OEM, FOLDER_VMI}
 
 # Aliases so the frontend can send the friendlier folder names.
 _FOLDER_ALIASES = {
@@ -61,6 +76,9 @@ _FOLDER_ALIASES = {
     "OEM": FOLDER_OEM,
     "PARTS_STMT": FOLDER_OEM,
     "MANUFACTURER": FOLDER_OEM,
+    "VEHICLE_MANUFACTURING": FOLDER_VMI,
+    "VEHICLE_MANUFACTURER": FOLDER_VMI,
+    "VMI": FOLDER_VMI,
 }
 
 
@@ -85,6 +103,9 @@ EX_VENDOR_NOT_FOUND = "VENDOR_NOT_FOUND"
 # Vendor stock orders are invoiced against an existing PO. If the number on the
 # invoice does not resolve, there is nothing to attach to.
 EX_PO_NOT_FOUND = "PO_NOT_FOUND"
+# The PO named on the invoice exists but cannot take it. The specific code
+# comes from po_reuse.blocking() -- PO_ALREADY_INVOICED or PO_CLOSED -- so
+# the message a person reads names the actual cause.
 EX_AMOUNT_MISMATCH = "AMOUNT_MISMATCH"
 EX_UNBALANCED = "UNBALANCED_ENTRY"
 # The parts read off an invoice do not add up to its total. Either OCR misread
@@ -94,6 +115,10 @@ EX_LINE_ITEMS_MISMATCH = "LINE_ITEMS_MISMATCH"
 # Nothing readable to itemise. A journal entry lists one line per part, so it
 # cannot be built from the invoice total alone.
 EX_NO_LINE_ITEMS = "NO_LINE_ITEMS"
+# The vehicle flow refused to build an entry: no template for the manufacturer,
+# or an amount the template needs was never written on the invoice. Not an
+# error -- a document that needs a human step before it can be processed.
+EX_VMI_REFUSED = "VEHICLE_ENTRY_REFUSED"
 EX_TEKION_ERROR = "TEKION_ERROR"
 # Tekion answered, and the answer was no. Distinct from TEKION_ERROR because a
 # rejection is final — retrying re-runs OCR and asks the same question again.
@@ -226,10 +251,28 @@ def _split_batch(doc: Document, source: str, session: Session) -> bool:
         return False
 
     for index, (seg, path, digest) in enumerate(written, start=1):
+        child_name = document_splitter.child_file_name(doc.file_name, seg, index)
+
+        # Each child gets its OWN archived copy. Inheriting the parent's key
+        # was wrong in a way that only shows up when someone opens one: the
+        # preview served the whole batch, so a document covering page 3 looked
+        # like it contained every invoice in the scan.
+        #
+        # A failure here is not fatal. The child still has its own file on
+        # local disk, which is what processing uses; only the preview is lost.
+        child_key = ""
+        if s3_service.is_configured():
+            try:
+                child_key = s3_service.build_s3_key(child_name, doc.dealership_name)
+                s3_service.upload_file(path, child_key)
+            except Exception as e:  # noqa: BLE001
+                print(f"[SPLIT] {doc.id} could not archive {child_name}: {e}")
+                child_key = ""
+
         session.add(
             Document(
-                file_name=document_splitter.child_file_name(doc.file_name, seg, index),
-                s3_key=doc.s3_key,
+                file_name=child_name,
+                s3_key=child_key,
                 source_path=path,
                 file_hash=digest,
                 dealership_name=doc.dealership_name,
@@ -257,27 +300,91 @@ def _split_batch(doc: Document, source: str, session: Session) -> bool:
     return True
 
 
+# ── OCR cache ────────────────────────────────────────────────────────────────
+#
+# The OCR result is written to disk for every document. Two reasons, and the
+# second is why it is a cache and not just a log:
+#
+#   * every extraction bug in the vehicle flow has come from guessing at a
+#     structure Gemini chose rather than reading it, and
+#   * a document re-run with corrected fields does not need reading again. The
+#     invoice has not changed, the upload's temp file is usually gone by then,
+#     and a second Gemini pass costs money to return the same answer.
+
+
+def _ocr_cache_path(doc: Document) -> Path:
+    return Path(tempfile.gettempdir()) / "rohrman" / "ocr" / f"{doc.id}.json"
+
+
+def _cache_ocr(doc: Document, ocr: dict[str, Any]) -> None:
+    try:
+        path = _ocr_cache_path(doc)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(ocr, indent=2, default=str), encoding="utf-8")
+        print(f"[PIPE] {doc.id} ocr cached at {path}")
+    except Exception as e:  # noqa: BLE001
+        # Never the reason a document fails: this is diagnostics and a
+        # convenience, and the document can always be read again.
+        print(f"[PIPE] {doc.id} could not cache OCR: {e}")
+
+
+def _load_cached_ocr(doc: Document) -> dict[str, Any] | None:
+    try:
+        path = _ocr_cache_path(doc)
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        print(f"[PIPE] {doc.id} could not read cached OCR: {e}")
+        return None
+
+
+def manual_overrides(doc: Document) -> dict[str, Any]:
+    """What a person typed in for this document, or {}."""
+    if not doc.manual_fields:
+        return {}
+    try:
+        parsed = json.loads(doc.manual_fields)
+        return parsed if isinstance(parsed, dict) else {}
+    except ValueError:
+        print(f"[PIPE] {doc.id} manual_fields is not valid JSON; ignoring")
+        return {}
+
+
 def _run(doc: Document, session: Session) -> None:
+    # A re-run with corrected fields reuses the OCR from the first attempt. The
+    # invoice has not changed, and by this point the uploaded temp file has
+    # usually been cleaned up -- so insisting on reading it again would make
+    # "fix the stock number and try again" impossible for exactly the documents
+    # that need it.
+    overrides = manual_overrides(doc)
+    cached = _load_cached_ocr(doc) if overrides else None
+
     # ── 1. Locate the file ───────────────────────────────────────────────────
     source = _resolve_source(doc)
-    if not source:
+    if not source and cached is None:
         _fail(session, doc, EX_FILE_MISSING, error=f"no readable source for {doc.file_name!r}")
         return
 
     # ── 1b. Split a batch scan before OCR ────────────────────────────────────
     # OCR describes one document, so several invoices in one file have to become
     # several documents first. Children are never re-segmented.
-    if not doc.split_from and _split_batch(doc, source, session):
+    if cached is None and not doc.split_from and _split_batch(doc, source, session):
         return
 
     # ── 2. OCR ───────────────────────────────────────────────────────────────
-    print(f"[PIPE] {doc.id} OCR starting ({doc.po_type} folder)")
-    try:
-        ocr = extract_document(source)
-    except Exception as e:  # noqa: BLE001
-        print(f"[PIPE] OCR failed: {e}")
-        _fail(session, doc, EX_OCR_FAILED, error=str(e))
-        return
+    if cached is not None:
+        print(f"[PIPE] {doc.id} re-run: reusing cached OCR, overrides={overrides}")
+        ocr = cached
+    else:
+        print(f"[PIPE] {doc.id} OCR starting ({doc.po_type} folder)")
+        try:
+            ocr = extract_document(source)
+        except Exception as e:  # noqa: BLE001
+            print(f"[PIPE] OCR failed: {e}")
+            _fail(session, doc, EX_OCR_FAILED, error=str(e))
+            return
+        _cache_ocr(doc, ocr)
 
     # ── 3. Record what OCR found ─────────────────────────────────────────────
     doc.ocr_document_type = ocr_helpers.get_document_type(ocr)
@@ -311,7 +418,9 @@ def _run(doc: Document, session: Session) -> None:
             return
 
     # ── 5. Dispatch on the folder ────────────────────────────────────────────
-    if doc.po_type == FOLDER_OEM:
+    if doc.po_type == FOLDER_VMI:
+        _run_vehicle_journal_entry(doc, ocr, session)
+    elif doc.po_type == FOLDER_OEM:
         _run_journal_entry(doc, ocr, session)
     elif doc.po_type == FOLDER_STOCK:
         # A vendor stock order is not created here — the PO already exists and
@@ -358,6 +467,9 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
         line_items=ocr_helpers.get_raw_line_items(ocr),
         # A GL account written on the invoice outranks anything we infer.
         invoice_gl_account=ocr_helpers.get_document_gl_account(ocr),
+        # Accounts with their own amounts. One debit line each, exactly as
+        # written -- see build_postings.
+        gl_splits=ocr_helpers.get_gl_amount_splits(ocr),
     )
 
     try:
@@ -393,6 +505,135 @@ def _run_journal_entry(doc: Document, ocr: dict[str, Any], session: Session) -> 
     doc.journal_id = result.journal_id or ""
     job_queue.complete(session, doc)
     print(f"[PIPE] {doc.id} -> PROCESSED (JE {doc.transaction_number}, {result.status})")
+
+
+# ── VEHICLE_MANUFACTURING -> Auto Posting journal entry ──────────────────────
+
+
+def _run_vehicle_journal_entry(
+    doc: Document, ocr: dict[str, Any], session: Session
+) -> None:
+    """Vehicle manufacturer invoice -> journal entry from a template.
+
+    Unlike the OEM flow this does not derive the entry from the invoice total.
+    The manufacturer decides the shape of the entry, and several of its amounts
+    are only on the page because a clerk wrote them there. When one is missing
+    the document is failed rather than approximated -- see vmi_je_creation.
+    """
+    from api.routes.tekion import get_client, reset_client
+    from api.services import vmi_helpers
+    from api.services.vmi_je_creation import create_vehicle_journal_entry
+
+
+    facts = vmi_helpers.build_facts(ocr, doc.dealership_name)
+    vmi_helpers.apply_overrides(facts, manual_overrides(doc))
+
+    # Only the accounting date is genuinely required. A vehicle entry is keyed on
+    # the STOCK NUMBER -- that is what goes in refId, refText and the
+    # description -- and invoice_number is not used to build it at all.
+    #
+    # Ford proves the point: its invoices carry no invoice number. The field is
+    # "Invoice & Unit Identification NO." and its value is the VIN. Demanding a
+    # number that does not exist rejected a document the flow could process
+    # perfectly well. The stock number is checked later, where it is used.
+    if not facts.invoice_date:
+        # Recorded the same way a flow refusal is, so the correction form knows
+        # to ask for a date even though this never reached the vehicle flow.
+        doc.vehicle_details = json.dumps({"needs": ["invoice_date"]})
+        session.add(doc)
+        _fail(session, doc, EX_MISSING_FIELD, error="missing: invoice_date")
+        return
+
+    print(
+        f"[PIPE] {doc.id} vehicle invoice: {facts.manufacturer or '(unknown make)'} "
+        f"stock={facts.stock_number or '-'} vin={facts.vin or '-'} "
+        f"cost={facts.dealer_cost_total:.2f} annotations={facts.gl_annotations}"
+    )
+    # The raw OCR fields this flow depends on. Printed unconditionally because
+    # when nothing is annotated the only useful question is what the model
+    # actually saw.
+    print(f"[PIPE] {doc.id} ocr.gl_mappings={ocr.get('gl_mappings')}")
+    print(f"[PIPE] {doc.id} ocr.handwritten_notes={ocr.get('handwritten_notes')}")
+
+
+    try:
+        # dealer_scope, not tekion_scope: it switches dealership INSIDE the lock,
+        # so no other job can retarget the shared client between the switch and
+        # the calls that follow. Using the bare lock here read another store's
+        # templates entirely -- see vmi_je_creation's dealer note.
+        with dealer_scope(get_client(session), doc.dealership_name):
+            client = get_client(session)
+            result = create_vehicle_journal_entry(client, facts, dry_run=False)
+    except Exception as e:  # noqa: BLE001
+        print(f"[PIPE] {doc.id} vehicle journal entry failed: {e}")
+        reset_client()
+        _fail(session, doc, EX_TEKION_ERROR, error=str(e))
+        return
+
+    # Recorded on EVERY outcome, before any of the branches below return. A
+    # refused document is the one someone opens, and until now the detail page
+    # had nothing to show them beyond the error string.
+    doc.vehicle_details = json.dumps(
+        {
+            "manufacturer": facts.manufacturer,
+            "stockNumber": facts.stock_number,
+            "vin": facts.vin,
+            "invoiceDate": facts.invoice_date,
+            "dealerCostTotal": facts.dealer_cost_total,
+            "msrpTotal": facts.msrp_total,
+            "glAnnotations": facts.gl_annotations,
+            "templateName": result.tekion_template_name,
+            "creditTotal": result.credit_total,
+            "debitTotal": result.debit_total,
+            "balance": result.balance,
+            "refusal": result.refusal,
+            # Which fields would fix it. Empty means nothing a person can type
+            # will -- the problem is Tekion configuration.
+            "needs": result.needs,
+            "postings": [
+                {
+                    "glAccount": p.get("_glAccountNumber"),
+                    "glName": p.get("description"),
+                    "amount": p.get("amount"),
+                    "control": p.get("_control"),
+                    "source": p.get("_source"),
+                }
+                for p in result.postings
+            ],
+        },
+        default=str,
+    )[:8000]
+    session.add(doc)
+    session.commit()
+
+    # Checked before the balance: a refused entry never reached the balance
+    # check, so reporting "balance $0.00" would be misleading.
+    if result.refusal:
+        _fail(session, doc, EX_VMI_REFUSED, error=result.refusal)
+        return
+    if result.problems:
+        _fail(
+            session,
+            doc,
+            EX_VMI_REFUSED,
+            error="; ".join(str(p) for p in result.problems),
+        )
+        return
+    if not result.balanced:
+        _fail(session, doc, EX_UNBALANCED, error=f"balance ${result.balance:.2f}")
+        return
+    if not result.saved:
+        _fail(session, doc, EX_TEKION_ERROR, error="draft was not saved")
+        return
+
+    doc.transaction_id = result.transaction_id or ""
+    doc.transaction_number = result.transaction_number or ""
+    doc.journal_id = result.journal_id or ""
+    job_queue.complete(session, doc)
+    print(
+        f"[PIPE] {doc.id} -> PROCESSED "
+        f"(vehicle JE {doc.transaction_number}, {len(result.postings)} lines)"
+    )
 
 
 # ── STOCK -> pre-invoice an existing vendor stock order ──────────────────────
@@ -446,6 +687,8 @@ def _run_stock_pre_invoice(
         invoice_file_name=doc.file_name or None,
         # Only consulted if Tekion has no GL accounts of its own for these parts.
         gl_account=ocr_helpers.get_document_gl_account(ocr),
+        # Accounts with their own amounts. These outrank Tekion's postings.
+        gl_splits=ocr_helpers.get_gl_amount_splits(ocr),
     )
 
     try:
@@ -487,6 +730,102 @@ def _run_stock_pre_invoice(
 # ── SUBLET / MISCELLANEOUS -> Purchase order ─────────────────────────────────
 
 
+def _resolve_existing_po(
+    doc: Document,
+    ocr: dict[str, Any],
+    session: Session,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Decide whether this invoice should reuse a purchase order already in Tekion.
+
+    Returns (existing_po, stop). `existing_po` is a PO to invoice instead of
+    creating one; `stop` means this run is over -- the document has been parked
+    for a decision or failed -- and the caller must return without posting.
+
+    THE ORDER OF THE QUESTIONS, and why each one exits early:
+
+      1. Is a PO number written on the invoice? No number means the invoice is
+         not referring to an existing order at all, and the normal flow is
+         simply right. This is the common case and costs one regex.
+
+      2. Did a person already answer for this run? "Create a new one" means
+         they looked and said no; honour it without asking twice. The answer is
+         consumed here, so a later upload is asked again.
+
+      3. Does that PO exist at THIS dealership? Only an exact match counts --
+         Tekion's search is fuzzy, and a near-miss must not be treated as the
+         PO the clerk meant.
+
+      4. Can it take this invoice? A cancelled PO cannot, and a PO already
+         carrying this invoice number must not. The second is not covered by
+         the duplicate check upstream: that catches a repeat of a document WE
+         processed, while this catches a PO invoiced in Tekion by hand, which
+         nothing in our own records would show.
+
+      5. Otherwise, ask. Nothing here decides on its own to post against an
+         order somebody else raised.
+    """
+    from api.routes.tekion import _resolve_dealer, get_client
+
+    if doc.po_type not in (FOLDER_SUBLET, FOLDER_MISC):
+        return None, False
+
+    po_number = ocr_helpers.get_po_number(ocr)
+    if not po_number:
+        return None, False
+
+    choice = (doc.po_choice or "").upper()
+    if choice:
+        # Consumed whichever way it went, so it applies to this attempt only.
+        doc.po_choice = ""
+        session.add(doc)
+        session.commit()
+
+    if choice == po_reuse.CHOICE_NEW:
+        print(f"[PIPE] {doc.id} PO {po_number} exists but a new one was requested")
+        return None, False
+
+    # The lookup is per-dealership, so the switch has to happen first.
+    with tekion_scope():
+        client = get_client(session)
+        _resolve_dealer(client, doc.dealership_name)
+        found = po_reuse.look_up(client, po_number)
+
+    if found is None:
+        print(f"[PIPE] {doc.id} PO {po_number!r} is not in Tekion -- creating a new one")
+        return None, False
+
+    doc.po_number = found.po_number or po_number
+    session.add(doc)
+    session.commit()
+
+    blocked_code, blocked = po_reuse.blocking(found, doc.invoice_number)
+
+    if choice == po_reuse.CHOICE_EXISTING:
+        if blocked:
+            # The PO changed between being offered and being chosen, or someone
+            # invoiced it in the meantime. Refusing beats posting anyway.
+            _fail(session, doc, blocked_code, error=blocked)
+            return None, True
+        print(f"[PIPE] {doc.id} reusing {po_reuse.describe(found)}")
+        return found.raw, False
+
+    if blocked:
+        # Nothing to ask: neither answer would help. A new PO is not the fix for
+        # an invoice that has already been posted against this one.
+        _fail(session, doc, blocked_code, error=blocked)
+        return None, True
+
+    job_queue.hold_for_po_decision(
+        session,
+        doc,
+        found,
+        # The card beside this spells out the choice; the row only needs to say
+        # which PO it is about.
+        po_reuse.describe(found),
+    )
+    return None, True
+
+
 def _run_purchase_order(
     doc: Document,
     ocr: dict[str, Any],
@@ -503,6 +842,7 @@ def _run_purchase_order(
 
     from api.models.schemas import (
         CreateMiscPoRequest,
+        GlSplitInput,
         CreateStockPoRequest,
         CreateSubletPoRequest,
         MiscLineItem,
@@ -553,6 +893,10 @@ def _run_purchase_order(
         "invoice_file_path": source_path,
     }
 
+    existing_po, stop = _resolve_existing_po(doc, ocr, session)
+    if stop:
+        return
+
     try:
         if doc.po_type == FOLDER_SUBLET:
             # Sublet invoices do not carry a trustworthy RO number, so the RO
@@ -562,6 +906,18 @@ def _run_purchase_order(
             # against the invoice's line-item descriptions by the LLM, using
             # the job's captured concern + tech story text — the OCR'd RO
             # number is no longer used at all.
+            #
+            # None of it applies to a PO somebody else already raised: that PO
+            # carries its own RO and job, and searching for another would at
+            # best find the same one and at worst fail the document over a step
+            # its outcome does not depend on.
+            if existing_po:
+                req = CreateSubletPoRequest(**common, line_items=[])
+                with tekion_scope():
+                    response = _create_sublet_po(req, session, existing_po=existing_po)
+                _finish_purchase_order(doc, response, session)
+                return
+
             if not doc.vin:
                 _fail(session, doc, EX_MISSING_FIELD, error="sublet with no VIN")
                 return
@@ -640,9 +996,22 @@ def _run_purchase_order(
                     unit_price=expected_po_total,
                 )
             ]
-            req = CreateMiscPoRequest(**common, line_items=misc_items)
+            # Accounts and amounts written as a block outrank anything derived
+            # from the rows -- see get_gl_amount_splits.
+            req = CreateMiscPoRequest(
+                **common,
+                line_items=misc_items,
+                gl_splits=[
+                    GlSplitInput(
+                        gl_account=sp["gl_account"],
+                        amount=sp["amount"],
+                        description=sp["description"],
+                    )
+                    for sp in ocr_helpers.get_gl_amount_splits(ocr)
+                ],
+            )
             with tekion_scope():
-                response = _create_misc_po(req, session)
+                response = _create_misc_po(req, session, existing_po=existing_po)
 
     except HTTPException as e:
         # An HTTPException here is Tekion (or our own validation) saying no:
@@ -664,11 +1033,22 @@ def _run_purchase_order(
         _fail(session, doc, EX_TEKION_ERROR, error=str(e))
         return
 
+    _finish_purchase_order(doc, response, session)
+
+
+def _finish_purchase_order(doc: Document, response: Any, session: Session) -> None:
+    """Record the outcome of a PO run, however the PO was arrived at.
+
+    Shared by the create path and the reuse path so the two cannot drift: a
+    reused PO is PROCESSED on exactly the same terms as one we raised.
+    """
     if not response.success:
         _fail(session, doc, EX_TEKION_ERROR, error=response.error or "PO creation failed")
         return
 
-    doc.po_number = response.po_number or ""
+    # `or doc.po_number` for the reuse path: the number was recorded when the
+    # PO was found, and a response that omits it should not blank it.
+    doc.po_number = response.po_number or doc.po_number or ""
     doc.vendor_name = response.vendor_name or doc.vendor_name
     job_queue.complete(session, doc)
     print(f"[PIPE] {doc.id} -> PROCESSED (PO {doc.po_number})")

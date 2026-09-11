@@ -6,6 +6,8 @@ from enum import Enum
 from typing import Annotated, Any, Literal, Union
 from uuid import UUID
 
+from typing import Any
+
 from pydantic import BaseModel, Field, EmailStr
 
 
@@ -125,9 +127,25 @@ class CreateSubletPoRequest(_CreatePoBase):
     line_items: list[SubletLineItem] = Field(default_factory=list, alias="lineItems")
 
 
+class GlSplitInput(BaseModel):
+    """One GL account and the share of the invoice it takes."""
+
+    gl_account: str = Field(alias="glAccount")
+    amount: float
+    description: str | None = None
+
+    model_config = {"populate_by_name": True}
+
+
 class CreateMiscPoRequest(_CreatePoBase):
     po_type: Literal["MISCELLANEOUS"] = "MISCELLANEOUS"
     line_items: list[MiscLineItem] = Field(default_factory=list, alias="lineItems")
+    # Accounts and amounts written on the invoice as a block, e.g.
+    # "GL# 7193 $2,378.11 / GL# 3142 $202.12". When present these ARE the
+    # posting split -- they say how the invoice divides, which the line items
+    # cannot: nothing in a parts table says which account the sales tax
+    # belongs in.
+    gl_splits: list[GlSplitInput] = Field(default_factory=list, alias="glSplits")
 
 
 class CreateStockPoRequest(_CreatePoBase):
@@ -240,6 +258,28 @@ class CurrentUserResponse(BaseModel):
     all_dealerships: bool = True
 
 
+class PasswordResetRequest(BaseModel):
+    """Ask for a reset link."""
+
+    email: EmailStr
+
+
+class PasswordResetConfirm(BaseModel):
+    """Redeem a reset link."""
+
+    token: str
+    # Same floor as signup. Anything shorter is not worth the round trip.
+    password: str = Field(min_length=8, max_length=128)
+
+
+class PasswordResetValidateResponse(BaseModel):
+    """Whether a reset link is still good, for the page behind it."""
+
+    valid: bool
+    email: str = ""
+    reason: str = ""
+
+
 class InviteValidateResponse(BaseModel):
     valid: bool
     # Shown on the signup page and used as the account's address, so the person
@@ -340,6 +380,38 @@ class PipelineFolder(str, Enum):
     MISCELLANEOUS = "MISCELLANEOUS"
     STOCK = "STOCK"
     OEM = "OEM"
+    VEHICLE_MANUFACTURING = "VEHICLE_MANUFACTURING"
+
+
+class PoDecisionRequest(BaseModel):
+    """Which purchase order to invoice against.
+
+    "existing" invoices the PO already in Tekion; "new" raises a fresh one, the
+    behaviour before this check existed. Honoured for one run either way.
+    """
+
+    choice: Literal["existing", "new"]
+
+
+class RerunRequest(BaseModel):
+    """Corrections to apply before running a refused document again.
+
+    Everything is optional and blank values are ignored, so a form with three
+    of eight boxes filled corrects three fields rather than clearing five.
+    """
+
+    stock_number: str = Field(default="", alias="stockNumber")
+    vin: str = ""
+    invoice_number: str = Field(default="", alias="invoiceNumber")
+    invoice_date: str = Field(default="", alias="invoiceDate")
+    dealership_name: str = Field(default="", alias="dealershipName")
+    manufacturer: str = ""
+    dealer_cost_total: str = Field(default="", alias="dealerCostTotal")
+    # {"2245": "904.00"} -- the GL account a clerk wrote, and the amount it
+    # points at. Merged into what OCR read rather than replacing it.
+    gl_annotations: dict[str, str] = Field(default_factory=dict, alias="glAnnotations")
+
+    model_config = {"populate_by_name": True}
 
 
 class PipelineAcceptedResponse(BaseModel):
@@ -373,6 +445,19 @@ class PipelineStatusResponse(BaseModel):
     ocr_document_type: str = Field(default="", alias="ocrDocumentType")
     # Set when status is DUPLICATE: the already-processed document this repeats.
     duplicate_of: UUID | None = Field(default=None, alias="duplicateOf")
+    # Set when status is PO_DECISION: the purchase order this invoice names,
+    # which already exists in Tekion. Carries its number, vendor, total, status
+    # and the invoices already on it, so the choice can be made without opening
+    # Tekion and without this endpoint calling it.
+    po_candidate: dict[str, Any] | None = Field(default=None, alias="poCandidate")
+    # What a person typed in on a previous re-run, so the form comes back filled
+    # rather than blank on the second correction.
+    manual_fields: dict[str, Any] = Field(default_factory=dict, alias="manualFields")
+    # What the vehicle flow read, matched and built. Present on refusals too.
+    vehicle_details: dict[str, Any] = Field(default_factory=dict, alias="vehicleDetails")
+    # Exactly which fields would fix this document, named by the code that
+    # refused it. The correction form renders these and nothing else.
+    needs_fields: list[str] = Field(default_factory=list, alias="needsFields")
     # Set when this document was cut out of a batch scan: the batch it came
     # from, and which of its pages this is ("1-2", "3").
     split_from: UUID | None = Field(default=None, alias="splitFrom")
@@ -385,6 +470,8 @@ class PipelineStatusResponse(BaseModel):
     # Queue bookkeeping — how many times it has been tried and why it last failed.
     attempts: int = 0
     last_error: str = Field(default="", alias="lastError")
+    # Display name (or email) of the user who uploaded it; "" if unknown.
+    uploaded_by: str = Field(default="", alias="uploadedBy")
     created_at: datetime = Field(alias="createdAt")
     processed_at: datetime | None = Field(default=None, alias="processedAt")
 
@@ -426,12 +513,21 @@ class DashboardSummary(BaseModel):
 
 
 class DocumentsByType(BaseModel):
+    """Document counts per intake folder.
+
+    One field per value of PipelineFolder. A folder missing here is counted by
+    the database and then dropped on the way out -- which is what happened to
+    VEHICLE_MANUFACTURING, whose card on Document Intake read zero while its
+    own page listed the documents. Add the field whenever a folder is added.
+    """
+
     SUBLET: int = 0
     MISCELLANEOUS: int = 0
     STOCK: int = 0
     # OEM documents become journal entries rather than POs, but they are counted
     # here too so the dashboard shows every folder.
     OEM: int = 0
+    VEHICLE_MANUFACTURING: int = 0
 
 
 class ExceptionItem(BaseModel):
